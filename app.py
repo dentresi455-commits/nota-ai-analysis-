@@ -4,7 +4,12 @@ import math
 import os
 import subprocess
 import tempfile
+import io
 from typing import Optional
+from timing_analysis import Event, analyze
+from advanced_analysis import extract_events, technical_score
+from professional_grading import grade as professional_grade
+from instrument_profiles import INSTRUMENTS, get_instrument, instrument_guidance
 
 import fitz
 import httpx
@@ -13,10 +18,19 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 from scipy.io import wavfile
 from scipy.signal import find_peaks
+from PIL import Image, ImageOps, UnidentifiedImageError
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    pass
 
-app = FastAPI(title="NOTA AI Analysis", version="0.3.0")
+app = FastAPI(title="NOTA AI Analysis", version="0.9.0")
 MAX_PDF = 8 * 1024 * 1024
-MAX_AUDIO = 12 * 1024 * 1024
+MAX_AUDIO = 24 * 1024 * 1024
+IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".tif", ".tiff", ".bmp"}
+VIDEO_EXT = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"}
+AUDIO_EXT = {".wav", ".mp3", ".m4a", ".ogg", ".flac", ".webm", ".aac"}
 
 
 def authorize(value):
@@ -73,6 +87,89 @@ def detailed_note_feedback(expected, actual):
             "feedback": "Review wrong-pitch positions and repeat the melody slowly."}
 
 
+def professional_report(comparison, score_info, audio_info):
+    """Evidence-bound Uzbek pedagogical report; no invented rhythm/tempo grades."""
+    details = comparison["detailed_feedback"]
+    issues = details["errors"]
+    advice = []
+    labels = {
+        "wrong_pitch": "Noto‘g‘ri nota",
+        "missing_note": "Tushib qolgan nota",
+        "extra_note": "Ortiqcha nota",
+    }
+    for issue in issues:
+        kind = issue["type"]
+        if kind == "wrong_pitch":
+            delta = issue["semitone_difference"]
+            advice.append({
+                "category": labels[kind],
+                "reference_note": issue["reference_position"],
+                "expected_midi": issue["expected_midi"],
+                "performed_midi": issue["performed_midi"],
+                "semitones": delta,
+                "explanation": f"Ijro etilgan tovush notadan {abs(delta)} yarim ton {'baland' if delta > 0 else 'past'}.",
+                "practice": "Shu notani alohida, so‘ng yonidagi notalar bilan sekin tempda mashq qiling.",
+            })
+        elif kind == "missing_note":
+            advice.append({
+                "category": labels[kind],
+                "reference_note": issue["reference_position"],
+                "expected_midi": issue["expected_midi"],
+                "explanation": "Notada mavjud tovush ijro ketma-ketligida topilmadi.",
+                "practice": "Ushbu nota oldi va keyingi tovushlar bilan bog‘lab qayta mashq qilinsin.",
+            })
+        else:
+            advice.append({
+                "category": labels[kind],
+                "performed_note": issue["performed_position"],
+                "performed_midi": issue["performed_midi"],
+                "explanation": "Notaga mos kelmaydigan qo‘shimcha tovush aniqlangan.",
+                "practice": "Ortiqcha tovush paydo bo‘lgan o‘tishni sekin va nazorat bilan qaytaring.",
+            })
+    measured = comparison["note_similarity_percent"]
+    confidence = score_info.get("confidence", "unknown")
+    return {
+        "title": "NOTA AI — ijroning pedagogik tahlili",
+        "status": "partial",
+        "overall_grade_100": None,
+        "pitch_sequence_similarity_percent": measured,
+        "pitch_score_is_not_overall_grade": True,
+        "notation_recognition_confidence": confidence,
+        "sections": {
+            "umumiy_xulosa": (
+                f"Nota va ijro tovushlari ketma-ketligi bo‘yicha taxminiy moslik {measured}%. "
+                "Bu yakuniy ijro bahosi emas: ritm, temp, artikulyatsiya va ifodalilik hali o‘lchanmagan."
+            ),
+            "baholash_mezonlari": {
+                "nota_ketma_ketligi": {"value_percent": measured, "status": "estimated"},
+                "intonatsiya": {"value": None, "status": "not_measured"},
+                "ritm": {"value": None, "status": "not_measured"},
+                "temp": {"value": None, "status": "not_measured"},
+                "artikulyatsiya": {"value": None, "status": "not_measured"},
+                "ifodalilik": {"value": None, "status": "not_measured"},
+            },
+            "aniqlangan_xatolar": advice,
+            "pedagog_xulosasi": (
+                "Aniqlangan noto‘g‘ri, tushib qolgan va ortiqcha tovushlar ustida "
+                "alohida ishlang. Takt va soniya bo‘yicha aniq xulosa chiqarish uchun "
+                "ishonchli nota davomiyligi va audio vaqt moslashuvi zarur."
+            ),
+            "individual_mashgulot_rejasi": [
+                {"minutes": 5, "task": "Aniqlangan xato notalarni alohida takrorlash"},
+                {"minutes": 7, "task": "Xato bo‘lgan melodik o‘tishlarni sekin mashq qilish"},
+                {"minutes": 5, "task": "Asarni to‘liq qayta ijro etish"},
+                {"minutes": 3, "task": "Yangi yozuvni oldingi ijro bilan solishtirish"},
+            ],
+        },
+        "measurement_limitations": [
+            "Takt raqami va xato soniyasi hisoblanmagan",
+            "Ritm, temp, dinamika, artikulyatsiya va ifodalilik baholanmagan",
+            "Ko‘p ovozli asarlarda natija ishonchsiz bo‘lishi mumkin",
+            "Tovush ajratish usuli taxminiy, nota tanish AI xato qilishi mumkin",
+        ],
+    }
+
+
 def compare_notes(expected, actual):
     n, m = len(expected), len(actual)
     prev = list(range(m + 1))
@@ -94,8 +191,31 @@ def compare_notes(expected, actual):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "0.3.0",
+    return {"status": "ok", "version": "0.9.0",
             "pdf_ai_configured": bool(os.getenv("GEMINI_API_KEY"))}
+
+
+
+class TimedNote(BaseModel):
+    midi: int = Field(ge=21, le=108)
+    start: float = Field(ge=0)
+    duration: float = Field(gt=0)
+
+class TimedAnalysisRequest(BaseModel):
+    reference: list[TimedNote] = Field(min_length=1, max_length=500)
+    performed: list[TimedNote] = Field(min_length=1, max_length=500)
+    beat_seconds: Optional[float] = Field(default=None, gt=0)
+    time_signature_numerator: Optional[int] = Field(default=None, ge=1, le=12)
+
+@app.post("/v1/analyze-timed")
+def analyze_timed(data: TimedAnalysisRequest, authorization: Optional[str] = Header(None)):
+    authorize(authorization)
+    reference = [Event(**e.model_dump()) for e in data.reference]
+    performed = [Event(**e.model_dump()) for e in data.performed]
+    try:
+        return analyze(reference, performed, data.beat_seconds, data.time_signature_numerator)
+    except ValueError as error:
+        raise HTTPException(422, str(error))
 
 
 @app.post("/v1/compare")
@@ -118,6 +238,27 @@ async def read_limited(upload, limit):
     return contents
 
 
+def normalize_score(raw, filename):
+    """Convert supported image files into a single-page PDF for the notation model."""
+    ext = os.path.splitext(filename or "")[1].lower()
+    if raw.startswith(b"%PDF"):
+        return raw, "pdf"
+    if ext not in IMAGE_EXT:
+        raise HTTPException(415, "Score must be PDF or a supported image")
+    try:
+        with Image.open(io.BytesIO(raw)) as img:
+            if img.width * img.height > 24_000_000:
+                raise HTTPException(413, "Image dimensions too large")
+            rgb = ImageOps.exif_transpose(img).convert("RGB")
+            output = io.BytesIO()
+            rgb.save(output, format="PDF", resolution=150)
+            return output.getvalue(), "image"
+    except HTTPException:
+        raise
+    except (UnidentifiedImageError, OSError, ValueError):
+        raise HTTPException(422, "Invalid or unsupported score image")
+
+
 async def pdf_to_notes(data, exercise=None):
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -133,9 +274,10 @@ async def pdf_to_notes(data, exercise=None):
         prompt = (f"Find ONLY exercise number {exercise:02d}. Ignore other exercises. "
                   if exercise is not None else "")
         prompt += ('Read the melody on this music score in page order. Return ONLY JSON '
-                   'with "notes" as MIDI pitch integers and "confidence" as high, medium, '
-                   'or low. Follow clefs and accidentals; do not invent unreadable notes. '
-                   'For polyphony choose the top melody line only. Maximum 300 notes.')
+                   'with "notes" as MIDI pitch integers, "events" as an array of objects '
+                   'each with midi (integer), onset_beats (number), duration_beats (positive number), '
+                   'and "confidence" as high, medium or low. Follow clefs, accidentals, rests, '
+                   'and time signatures; never invent unreadable notes. Return one melody, max 300 notes.')
         parts = [{"text": prompt}]
         for page in doc:
             pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
@@ -160,7 +302,19 @@ async def pdf_to_notes(data, exercise=None):
         notes = [x for x in parsed.get("notes", []) if type(x) is int and 21 <= x <= 108][:300]
         if not notes:
             raise HTTPException(422, "No reliable music notes recognized in PDF")
-        return {"notes": notes, "confidence": parsed.get("confidence", "unknown")}
+        events=[]
+        for e in parsed.get("events", [])[:300]:
+            if not isinstance(e,dict):continue
+            midi=e.get("midi");onset=e.get("onset_beats");dur=e.get("duration_beats")
+            if (type(midi) is int and 21<=midi<=108 and isinstance(onset,(int,float))
+                and isinstance(dur,(int,float)) and math.isfinite(onset) and math.isfinite(dur)
+                and onset>=0 and 0<dur<=32):
+                events.append({"midi":midi,"onset_beats":round(onset,4),"duration_beats":round(dur,4)})
+        if len(events)!=len(notes) or [e["midi"] for e in events]!=notes:
+            events=[]
+        return {"notes": notes, "events": events,
+                "confidence": parsed.get("confidence", "unknown"),
+                "timing_status":"estimated_from_omr" if events else "not_available"}
     except HTTPException:
         raise
     except (ValueError, KeyError, IndexError, httpx.HTTPError):
@@ -169,8 +323,8 @@ async def pdf_to_notes(data, exercise=None):
 
 def audio_to_notes(raw, filename):
     ext = os.path.splitext(filename or "")[1].lower()
-    if ext not in (".wav", ".mp3", ".m4a", ".ogg", ".flac", ".webm"):
-        raise HTTPException(415, "Supported audio: wav, mp3, m4a, ogg, flac, webm")
+    if ext not in AUDIO_EXT | VIDEO_EXT:
+        raise HTTPException(415, "Unsupported audio/video format")
     with tempfile.TemporaryDirectory() as folder:
         path = os.path.join(folder, "input" + ext)
         with open(path, "wb") as f:
@@ -216,23 +370,75 @@ def audio_to_notes(raw, filename):
     for note in smoothed:
         if not collapsed or collapsed[-1] != note:
             collapsed.append(note)
-    return {"notes": collapsed[:300], "duration_seconds": round(len(samples) / rate, 2),
+    events=extract_events(samples,rate)
+    if events:
+        collapsed=[e["midi"] for e in events]
+    return {"notes": collapsed[:300], "events":events,
+            "timing_status":"estimated_from_monophonic_audio" if events else "not_available",
+            "duration_seconds": round(len(samples) / rate, 2),
             "method": "spectral dominant pitch (monophonic approximation)"}
+
+
+@app.get("/v1/instruments")
+def list_instruments():
+    return {"count": len(INSTRUMENTS), "instruments": list(INSTRUMENTS.values())}
 
 
 @app.post("/v1/analyze-files")
 async def analyze_files(score: UploadFile = File(...), audio: UploadFile = File(...),
                         authorization: Optional[str] = Header(None),
-                        exercise: Optional[int] = Form(None)):
+                        exercise: Optional[int] = Form(None),
+                        bpm: Optional[float] = Form(None),
+                        beats_per_measure: Optional[int] = Form(None),
+                        instrument: Optional[str] = Form(None)):
     authorize(authorization)
+    profile = get_instrument(instrument)
+    if instrument is not None and profile is None:
+        raise HTTPException(422, "Unknown instrument. See GET /v1/instruments")
     if exercise is not None and not 1 <= exercise <= 99:
         raise HTTPException(422, "Exercise must be between 1 and 99")
     pdf_bytes = await read_limited(score, MAX_PDF)
     audio_bytes = await read_limited(audio, MAX_AUDIO)
-    score_data = await pdf_to_notes(pdf_bytes, exercise)
+    normalized_score, score_type = normalize_score(pdf_bytes, score.filename)
+    score_data = await pdf_to_notes(normalized_score, exercise)
     audio_data = audio_to_notes(audio_bytes, audio.filename)
     result = compare_notes(score_data["notes"], audio_data["notes"])
-    return {"score": score_data, "audio": audio_data, "comparison": result,
+    report = professional_report(result, score_data, audio_data)
+    guidance = instrument_guidance(profile)
+    report["instrument_guidance"] = guidance
+    timed=None
+    grade={"status":"insufficient_evidence","technical_score_100":None,"professional_score_100":None}
+    if bpm is not None and not 20 <= bpm <= 300:
+        raise HTTPException(422,"BPM must be 20..300")
+    if beats_per_measure is not None and not 1 <= beats_per_measure <= 12:
+        raise HTTPException(422,"beats_per_measure must be 1..12")
+    if bpm and score_data.get("events") and audio_data.get("events"):
+        try:
+            reference=[Event(midi=e["midi"],start=e["onset_beats"]*60/bpm,
+                             duration=e["duration_beats"]*60/bpm) for e in score_data["events"]]
+            performed=[Event(midi=e["midi"],start=e["start"],duration=e["duration"])
+                       for e in audio_data["events"]]
+            timed=analyze(reference,performed,60/bpm,beats_per_measure)
+            grade=technical_score(timed,score_confidence=score_data["confidence"],
+                                  audio_events=audio_data["events"])
+        except ValueError:
+            pass
+    if timed is not None:
+        report["sections"]["baholash_mezonlari"]["ritm"] = timed["rhythm"]
+        report["sections"]["baholash_mezonlari"]["temp"] = timed["tempo"]
+        report["timed_errors"] = timed["note_errors"]
+        report["sections"]["umumiy_xulosa"] += (
+            " Ritm va temp natijalari dastlabki hisoblangan baholar bo‘lib, "
+            "professional tekshiruvdan o‘tmagan."
+        )
+    return {"score": score_data, "score_input_type": score_type, "audio": audio_data,
+            "comparison": result, "professional_report": report,
+            "selected_instrument": profile["id"] if profile else None,
+            "instrument_guidance": guidance,
+            "timed_analysis":timed,"technical_grading":grade,
+            "professional_grading":professional_grade({}),
             "limitations": ["Monophonic melody only", "No verified rhythm assessment",
                             "AI sheet-music extraction may be inaccurate",
-                            "Instrument harmonics may affect pitch detection"]}
+                            "Instrument harmonics may affect pitch detection",
+                            "Video is assessed from its extracted audio only",
+                            "File accepted does not guarantee accurate transcription"]}
