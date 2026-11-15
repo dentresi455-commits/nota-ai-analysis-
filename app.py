@@ -71,7 +71,7 @@ async def read_limited(upload, limit):
     return contents
 
 
-async def pdf_to_notes(data):
+async def pdf_to_notes(data, exercise=None):
     api_key = os.getenv('GEMINI_API_KEY')
     if not api_key:
         raise HTTPException(503, 'GEMINI_API_KEY is not configured')
@@ -83,7 +83,7 @@ async def pdf_to_notes(data):
             raise HTTPException(422, 'Encrypted PDFs are not supported')
         if not 1 <= len(doc) <= 4:
             raise HTTPException(422, 'PDF must contain 1 to 4 pages')
-        parts = [{'text': ('Read the melody on this music score in page order. Return ONLY JSON with '
+        parts = [{'text': ((f'Find ONLY exercise number {exercise:02d} on the provided sheet. Ignore all other numbered exercises. ' if exercise is not None else '') + 'Read the melody on this music score in page order. Return ONLY JSON with '
                            '"notes" as MIDI pitch integers and "confidence" as high, medium, or low. '
                            'Follow clefs and accidentals; do not invent unreadable notes. '
                            'For polyphony choose the top melody line only. Maximum 300 notes.')}]
@@ -175,11 +175,13 @@ def audio_to_notes(raw, filename):
 
 @app.post('/v1/analyze-files')
 async def analyze_files(score: UploadFile = File(...), audio: UploadFile = File(...),
-                        authorization: Optional[str] = Header(None)):
+                        authorization: Optional[str] = Header(None), exercise: Optional[int] = Form(None)):
     authorize(authorization)
+    if exercise is not None and not 1 <= exercise <= 99:
+        raise HTTPException(422, 'Exercise must be between 1 and 99')
     pdf_bytes = await read_limited(score, MAX_PDF)
     audio_bytes = await read_limited(audio, MAX_AUDIO)
-    score_data = await pdf_to_notes(pdf_bytes)
+    score_data = await pdf_to_notes(pdf_bytes, exercise)
     audio_data = audio_to_notes(audio_bytes, audio.filename)
     result = compare_notes(score_data['notes'], audio_data['notes'])
     return {'score': score_data, 'audio': audio_data, 'comparison': result,
