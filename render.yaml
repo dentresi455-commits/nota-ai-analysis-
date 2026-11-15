@@ -9,3 +9,5 @@ services:
     envVars:
       - key: NOTA_API_TOKEN
         generateValue: true
+      - key: GEMINI_API_KEY
+        sync: false
