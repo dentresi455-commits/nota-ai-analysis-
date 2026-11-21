@@ -400,7 +400,11 @@ async def analyze_files(score: UploadFile = File(...), audio: UploadFile = File(
     pdf_bytes = await read_limited(score, MAX_PDF)
     audio_bytes = await read_limited(audio, MAX_AUDIO)
     normalized_score, score_type = normalize_score(pdf_bytes, score.filename)
-    score_data = await pdf_to_notes(normalized_score, exercise)
+    if os.getenv("NOTA_OMR_V3_ENABLED", "false").lower() == "true":
+        from score_omr_v3 import pdf_to_notes as pdf_to_notes_v3
+        score_data = await pdf_to_notes_v3(normalized_score, exercise)
+    else:
+        score_data = await pdf_to_notes(normalized_score, exercise)
     audio_data = audio_to_notes(audio_bytes, audio.filename)
     result = compare_notes(score_data["notes"], audio_data["notes"])
     report = professional_report(result, score_data, audio_data)
