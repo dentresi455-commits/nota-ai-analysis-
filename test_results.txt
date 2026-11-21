@@ -1,0 +1,33 @@
+test_high_confidence_result_one_call (test_score_omr_v2.TestGeminiRecheck.test_high_confidence_result_one_call) ... ok
+test_uncertain_result_rechecked_and_disagreement_flagged (test_score_omr_v2.TestGeminiRecheck.test_uncertain_result_rechecked_and_disagreement_flagged) ... ok
+test_event_schema (test_score_omr_v2.TestOMRV2.test_event_schema) ... ok
+test_invalid_pdf (test_score_omr_v2.TestOMRV2.test_invalid_pdf) ... ok
+test_low_quality_hint (test_score_omr_v2.TestOMRV2.test_low_quality_hint) ... ok
+test_many_pages_without_truncation (test_score_omr_v2.TestOMRV2.test_many_pages_without_truncation) ... ok
+test_mismatch_rejected (test_score_omr_v2.TestOMRV2.test_mismatch_rejected) ... ok
+test_onset_offset_across_pages (test_score_omr_v2.TestOMRV2.test_onset_offset_across_pages) ... ok
+test_page_limit (test_score_omr_v2.TestOMRV2.test_page_limit) ... ok
+test_partial_timing_cannot_be_presented_as_complete (test_score_omr_v2.TestOMRV2.test_partial_timing_cannot_be_presented_as_complete) ... ok
+test_pdf_workflow_with_fake_ai (test_score_omr_v2.TestOMRV2.test_pdf_workflow_with_fake_ai) ... ok
+test_unsorted_rejected (test_score_omr_v2.TestOMRV2.test_unsorted_rejected) ... ok
+test_wrong_note_rejected (test_score_omr_v2.TestOMRV2.test_wrong_note_rejected) ... ok
+test_excludes_fingering_as_midi (test_photo_omr_v3.ContractTests.test_excludes_fingering_as_midi) ... ok
+test_join_keeps_system_sequence (test_photo_omr_v3.ContractTests.test_join_keeps_system_sequence) ... ok
+test_json_contract_needs_review (test_photo_omr_v3.ContractTests.test_json_contract_needs_review) ... ok
+test_rejects_unmatched_notes_and_events (test_photo_omr_v3.ContractTests.test_rejects_unmatched_notes_and_events) ... ok
+test_omr_pdf_flow_with_real_sample_mocked_provider (test_photo_omr_v3.MockedAITests.test_omr_pdf_flow_with_real_sample_mocked_provider) ... Executing <Task finished name='Task-17' coro=<MockedAITests.test_omr_pdf_flow_with_real_sample_mocked_provider() done, defined at /mnt/data/nota_ai_omr_v3/test_photo_omr_v3.py:97> result=None created at /usr/lib/python3.13/asyncio/runners.py:100> took 1.559 seconds
+ok
+test_second_pass_disagreement_becomes_review (test_photo_omr_v3.MockedAITests.test_second_pass_disagreement_becomes_review) ... ok
+test_blue_annotation_suppressed_alternative (test_photo_omr_v3.PreprocessingTests.test_blue_annotation_suppressed_alternative) ... ok
+test_dilnoz_photo_orientation_and_systems (test_photo_omr_v3.PreprocessingTests.test_dilnoz_photo_orientation_and_systems) ... ok
+test_exif_and_large_limit (test_photo_omr_v3.PreprocessingTests.test_exif_and_large_limit) ... ok
+test_invalid_rotation_rejected (test_photo_omr_v3.PreprocessingTests.test_invalid_rotation_rejected) ... ok
+test_no_annotation_does_not_invent_colored_ink (test_photo_omr_v3.PreprocessingTests.test_no_annotation_does_not_invent_colored_ink) ... ok
+test_rotation_override (test_photo_omr_v3.PreprocessingTests.test_rotation_override) ... ok
+test_flag_off_and_backup (test_integration.TestIntegration.test_flag_off_and_backup) ... ok
+test_unknown_source_refused (test_integration.TestIntegration.test_unknown_source_refused) ... ok
+
+----------------------------------------------------------------------
+Ran 27 tests in 6.869s
+
+OK
