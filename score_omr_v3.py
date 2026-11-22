@@ -283,7 +283,7 @@ def _join_pages(pages: list[dict]) -> dict:
     return {"notes":notes,"events":events if timing_complete else [],
             "confidence":confidence,
             "timing_status":"estimated_from_omr" if timing_complete else "not_available",
-            "pages":metadata,"page_count":len(pages),
+            "pages":metadata,"page_count":len({p["page"] for p in pages}),
             "needs_review":any(p["needs_review"] for p in metadata),
             "transcription_status":"estimated_unverified"}
 
