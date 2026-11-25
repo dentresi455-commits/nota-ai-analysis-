@@ -27,7 +27,7 @@ except ImportError:
 
 app = FastAPI(title="NOTA AI Analysis", version="0.9.0")
 MAX_PDF = 8 * 1024 * 1024
-MAX_AUDIO = 24 * 1024 * 1024
+MAX_AUDIO = 96 * 1024 * 1024
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".tif", ".tiff", ".bmp"}
 VIDEO_EXT = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"}
 AUDIO_EXT = {".wav", ".mp3", ".m4a", ".ogg", ".flac", ".webm", ".aac"}
@@ -329,10 +329,10 @@ def audio_to_notes(raw, filename):
         path = os.path.join(folder, "input" + ext)
         with open(path, "wb") as f:
             f.write(raw)
-        command = ["ffmpeg", "-v", "error", "-nostdin", "-i", path, "-t", "90",
+        command = ["ffmpeg", "-v", "error", "-nostdin", "-i", path, "-t", "900",
                    "-ac", "1", "-ar", "16000", "-f", "wav", os.path.join(folder, "audio.wav")]
         try:
-            proc = subprocess.run(command, capture_output=True, timeout=25)
+            proc = subprocess.run(command, capture_output=True, timeout=180)
         except (FileNotFoundError, subprocess.TimeoutExpired):
             raise HTTPException(503, "Audio converter unavailable")
         if proc.returncode:
