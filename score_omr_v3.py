@@ -34,7 +34,7 @@ MAX_SYSTEMS_PER_PAGE = 12
 # Do not increase the timeout beyond the calling frontend/proxy's limit.
 OMR_TOTAL_TIMEOUT_SECONDS = 52
 OMR_REQUEST_TIMEOUT_SECONDS = 20
-OMR_CONCURRENT_SYSTEMS = 3
+OMR_CONCURRENT_SYSTEMS = max(1, min(3, int(os.getenv("NOTA_OMR_CONCURRENT_SYSTEMS", "2"))))
 
 PROMPT = """You are a careful optical music transcription specialist.
 Transcribe ONE page of a conventional printed music score from left to right,
@@ -186,6 +186,63 @@ def _validated_page(data: Any, page_number: int) -> dict:
             "needs_review":needs_review,"warnings":warnings}
 
 
+# NOTA_OMR_FALLBACK_V1: opt-in third-party vision fallback for repeated Gemini 5xx.
+# Third-party requests MUST be explicitly enabled in Render staging. Provider
+# keys and model IDs must be configured there; no credentials are embedded here.
+async def _optional_vision_fallback(img: Image.Image, instruction: str,
+                                    page_number: int, client: httpx.AsyncClient,
+                                    failed_reason: str) -> dict | None:
+    if os.getenv("NOTA_ENABLE_VISION_FALLBACK", "false").lower() != "true":
+        return None
+    data_url = "data:image/png;base64," + _to_png_base64(img)
+    content = [
+        {"type": "text", "text": instruction},
+        {"type": "image_url", "image_url": {"url": data_url}},
+    ]
+    providers = [
+        ("openrouter", "OPENROUTER_API_KEY", "NOTA_OPENROUTER_VISION_MODEL",
+         "https://openrouter.ai/api/v1/chat/completions"),
+        ("groq", "GROQ_API_KEY", "NOTA_GROQ_VISION_MODEL",
+         "https://api.groq.com/openai/v1/chat/completions"),
+    ]
+    for name, key_env, model_env, url in providers:
+        api_key, model = os.getenv(key_env, "").strip(), os.getenv(model_env, "").strip()
+        # Never guess a provider/model.  Skip unavailable or improperly configured.
+        if not api_key or not model or len(model) > 150 or not re.fullmatch(r"[a-zA-Z0-9_.:/-]+", model):
+            continue
+        try:
+            response = await client.post(
+                url,
+                headers={"Authorization": "Bearer " + api_key,
+                         "Content-Type": "application/json"},
+                json={"model": model,
+                      "messages": [{"role": "user", "content": content}],
+                      "temperature": 0, "max_tokens": 4096},
+                timeout=15,
+            )
+            # Fail closed for auth, unsupported model, quota or provider outage.
+            if response.status_code != 200:
+                continue
+            payload = response.json()
+            message = payload["choices"][0]["message"]["content"]
+            if isinstance(message, list):
+                message = "".join(p.get("text", "") for p in message if isinstance(p, dict))
+            if not isinstance(message, str):
+                continue
+            clean = message.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            result = _validated_page(json.loads(clean), page_number)
+            result["confidence"] = "low"
+            result["needs_review"] = True
+            result["warnings"] = list(dict.fromkeys([
+                *result["warnings"], "vision_fallback_used_" + name,
+                "gemini_retryable_failure", "fallback_requires_teacher_review",
+            ]))
+            return result
+        except (httpx.HTTPError, ValueError, KeyError, TypeError, IndexError):
+            continue
+    return None
+
+
 async def _gemini_page(img: Image.Image, *, page_number: int, exercise: int | None,
                        client: httpx.AsyncClient, alternate: Image.Image | None = None,
                        require_second_pass: bool = False, system: int | None = None) -> dict:
@@ -208,6 +265,7 @@ async def _gemini_page(img: Image.Image, *, page_number: int, exercise: int | No
     if exercise is not None:
         instruction += f"\nOnly exercise number {exercise}; ignore other exercises."
     last_reason = "invalid_response"
+    retryable_upstream_failure = False
     first_valid = None
     retry_happened = False
 
@@ -233,6 +291,7 @@ async def _gemini_page(img: Image.Image, *, page_number: int, exercise: int | No
                 raise HTTPException(status_code=503, detail="gemini_rate_limited")
             if response.status_code in (408, 500, 502, 503, 504):
                 last_reason = f"gemini_upstream_{response.status_code}"
+                retryable_upstream_failure = True
                 retry_happened = True
                 overloaded = response.status_code in (500, 502, 503, 504)
                 if attempt + 1 < MAX_PAGE_AI_ATTEMPTS:
@@ -279,6 +338,7 @@ async def _gemini_page(img: Image.Image, *, page_number: int, exercise: int | No
             raise
         except (httpx.TimeoutException, httpx.TransportError):
             last_reason = "gemini_timeout_or_network"
+            retryable_upstream_failure = True
             retry_happened = True
         except (json.JSONDecodeError, ValueError, KeyError, IndexError, TypeError):
             last_reason = "gemini_invalid_response"
@@ -289,6 +349,11 @@ async def _gemini_page(img: Image.Image, *, page_number: int, exercise: int | No
         first_valid["needs_review"] = True
         first_valid["confidence"] = "low"
         return first_valid
+    if retryable_upstream_failure:
+        backup_result = await _optional_vision_fallback(
+            img, instruction, page_number, client, last_reason)
+        if backup_result is not None:
+            return backup_result
     raise HTTPException(status_code=502, detail=f"gemini_omr_failed_{last_reason}")
 
 
