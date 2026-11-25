@@ -6,11 +6,13 @@ It is NOT a complete background-job queue, nor a verified music transcription mo
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
 import math
 import os
+import re
 from typing import Any
 
 import fitz
@@ -26,6 +28,12 @@ MAX_PAGE_PIXELS = 7_000_000
 MAX_PDF_BYTES = 32 * 1024 * 1024
 MAX_PAGE_AI_ATTEMPTS = 2
 MAX_SYSTEMS_PER_PAGE = 12
+
+# Bounded synchronous preview. Large scores need a durable background job queue.
+# Do not increase the timeout beyond the calling frontend/proxy's limit.
+OMR_TOTAL_TIMEOUT_SECONDS = 52
+OMR_REQUEST_TIMEOUT_SECONDS = 20
+OMR_CONCURRENT_SYSTEMS = 3
 
 PROMPT = """You are a careful optical music transcription specialist.
 Transcribe ONE page of a conventional printed music score from left to right,
@@ -180,10 +188,13 @@ def _validated_page(data: Any, page_number: int) -> dict:
 async def _gemini_page(img: Image.Image, *, page_number: int, exercise: int | None,
                        client: httpx.AsyncClient, alternate: Image.Image | None = None,
                        require_second_pass: bool = False, system: int | None = None) -> dict:
+    """Read one cropped staff; provider errors are explicit and never become scores."""
     key = os.getenv("GEMINI_API_KEY")
     if not key:
-        raise HTTPException(status_code=503, detail="GEMINI_API_KEY is not configured")
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        raise HTTPException(status_code=503, detail="gemini_key_missing")
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+    if not re.fullmatch(r"gemini-[a-zA-Z0-9_.-]+", model):
+        raise HTTPException(status_code=503, detail="gemini_model_invalid")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     instruction = PROMPT
     if system is not None:
@@ -192,22 +203,34 @@ async def _gemini_page(img: Image.Image, *, page_number: int, exercise: int | No
         instruction += f"\nOnly exercise number {exercise}; ignore other exercises."
     last_reason = "invalid_response"
     first_valid = None
+    retry_happened = False
+
     for attempt in range(MAX_PAGE_AI_ATTEMPTS):
         render = img if attempt == 0 else (alternate if alternate is not None else _improve_image(img))
         payload = {
-            "contents":[{"parts":[
+            "contents": [{"parts": [
                 {"text": instruction},
-                {"inline_data":{"mime_type":"image/png","data":_to_png_base64(render)}}
+                {"inline_data": {"mime_type": "image/png", "data": _to_png_base64(render)}}
             ]}],
-            "generationConfig":{"temperature":0,"responseMimeType":"application/json", "maxOutputTokens":8192}
+            "generationConfig": {"temperature": 0, "responseMimeType": "application/json", "maxOutputTokens": 4096}
         }
         try:
             response = await client.post(url, headers={"x-goog-api-key": key}, json=payload)
-            if response.status_code in (408,429,500,502,503,504):
-                last_reason = f"provider_{response.status_code}"
+            if response.status_code in (401, 403):
+                raise HTTPException(status_code=502, detail="gemini_key_not_authorized")
+            if response.status_code == 404:
+                raise HTTPException(status_code=502, detail="gemini_model_not_found")
+            if response.status_code == 429:
+                # Avoid burning quota with an immediate storm of retries.
+                raise HTTPException(status_code=503, detail="gemini_rate_limited")
+            if response.status_code in (408, 500, 502, 503, 504):
+                last_reason = f"gemini_upstream_{response.status_code}"
+                retry_happened = True
+                if attempt + 1 < MAX_PAGE_AI_ATTEMPTS:
+                    await asyncio.sleep(0.4)
                 continue
             if response.status_code != 200:
-                raise HTTPException(status_code=502, detail=f"OMR provider error: HTTP {response.status_code} on page {page_number}")
+                raise HTTPException(status_code=502, detail=f"gemini_unexpected_http_{response.status_code}")
             body = response.json()
             response_text = "".join(p.get("text", "") for p in body["candidates"][0]["content"]["parts"])
             try:
@@ -216,12 +239,20 @@ async def _gemini_page(img: Image.Image, *, page_number: int, exercise: int | No
                 clean = response_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
                 obj = json.loads(clean)
             result = _validated_page(obj, page_number)
+            if retry_happened:
+                result["warnings"].append("gemini_retry_recovered")
+                result["needs_review"] = True
+                result["confidence"] = "low"
             if first_valid is None:
                 first_valid = result
-                if (result["confidence"] == "high" and not result["needs_review"]
-                    and not require_second_pass):
+                if result["confidence"] == "high" and not result["needs_review"]:
+                    if require_second_pass:
+                        # Manual annotations need review, but never force a
+                        # duplicate model call when the first reading is clear.
+                        result["warnings"].append("annotation_recheck_deferred")
+                        result["needs_review"] = True
+                        result["confidence"] = "medium"
                     return result
-                # A medium/low-confidence first reading gets a second enhanced scan.
                 continue
             if (result["notes"] != first_valid["notes"] or
                 result.get("events") != first_valid.get("events")):
@@ -229,25 +260,26 @@ async def _gemini_page(img: Image.Image, *, page_number: int, exercise: int | No
                 first_valid["needs_review"] = True
                 first_valid["confidence"] = "low"
                 return first_valid
-            # Two passes agree on pitches, but their confidence remains an estimate.
             chosen = result if result["confidence"] == "high" and result["events"] else first_valid
             chosen["warnings"].append("confirmed_pitch_sequence_by_second_pass")
             chosen["needs_review"] = bool(first_valid["needs_review"] or result["needs_review"])
             return chosen
         except HTTPException:
-            if first_valid is None:
-                raise
-            last_reason = "provider_error_on_recheck"
+            # Invalid credentials/model/quota are fatal: do not suppress them.
+            raise
         except (httpx.TimeoutException, httpx.TransportError):
-            last_reason = "provider_timeout_or_network"
+            last_reason = "gemini_timeout_or_network"
+            retry_happened = True
         except (json.JSONDecodeError, ValueError, KeyError, IndexError, TypeError):
-            last_reason = "invalid_response"
+            last_reason = "gemini_invalid_response"
+            retry_happened = True
+
     if first_valid is not None:
         first_valid["warnings"].append("recheck_unavailable_" + last_reason)
         first_valid["needs_review"] = True
+        first_valid["confidence"] = "low"
         return first_valid
-    raise HTTPException(status_code=502, detail=f"OMR failed on page {page_number}: {last_reason}")
-
+    raise HTTPException(status_code=502, detail=f"gemini_omr_failed_{last_reason}")
 
 
 def _join_pages(pages: list[dict]) -> dict:
@@ -289,10 +321,12 @@ def _join_pages(pages: list[dict]) -> dict:
 
 
 async def pdf_to_notes(data: bytes, exercise: int | None = None) -> dict:
-    """Photo-aware, system-aware score OMR.
+    """Bounded, concurrent per-system OMR for synchronous staging requests.
 
-    Intended for preview with bounded short requests; long scores must use
-    a durable job worker. Each system carries an explicit review flag.
+    Per-page order is preserved, even when Gemini calls finish out of order.
+    Any failed system rejects the complete comparison (never fabricate notes
+    or award a score from an incomplete transcription). Long music scores
+    require a durable queue/worker, not a longer HTTP timeout.
     """
     if not isinstance(data, bytes) or len(data) > MAX_PDF_BYTES:
         raise HTTPException(status_code=413, detail="PDF too large")
@@ -307,49 +341,106 @@ async def pdf_to_notes(data: bytes, exercise: int | None = None) -> dict:
             raise HTTPException(status_code=422, detail="Encrypted PDF unsupported")
         if not 1 <= len(doc) <= MAX_PAGES:
             raise HTTPException(status_code=413, detail=f"PDF must have 1..{MAX_PAGES} pages")
-        chunks = []
-        summaries = []
-        # These sequential calls are bounded locally for staging.  In a durable
-        # queue, each chunk can be retried independently and checkpointed.
-        async with httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=10.0)) as client:
-            for page_idx in range(len(doc)):
-                prepared = prepare_pdf_page(doc[page_idx])
-                original_crops = crop_systems(prepared, "original")
-                cleaned_crops = crop_systems(prepared, "ink_suppressed")
-                if len(original_crops)>MAX_SYSTEMS_PER_PAGE:
-                    raise HTTPException(status_code=413, detail="Too many staff systems on a page")
-                page_warnings=list(prepared.warnings)
-                page_chunks = []
-                for system_idx, (original_crop, cleaned_crop) in enumerate(zip(original_crops,cleaned_crops), 1):
-                    p = await _gemini_page(
-                        original_crop, page_number=page_idx+1, exercise=exercise,
-                        client=client,
-                        alternate=cleaned_crop if "colored_handwritten_annotations_detected" in page_warnings else None,
-                        require_second_pass="colored_handwritten_annotations_detected" in page_warnings,
-                        system=system_idx if len(original_crops)>1 else None,
-                    )
-                    p["system"] = system_idx
-                    p["warnings"] = list(dict.fromkeys([*p.get("warnings",[]),*page_warnings]))
-                    p["needs_review"] = p["needs_review"] or bool(page_warnings)
-                    if system_idx>1:
-                        p["warnings"].append("review_cross_system_bar_or_tie")
-                        p["needs_review"] = True
-                    page_chunks.append(p)
-                    chunks.append(p)
-                summaries.append({
-                    "page":page_idx+1,
-                    "systems":len(original_crops),
-                    "orientation_degrees_ccw":prepared.orientation_degrees,
-                    "rotation_confidence":prepared.rotation_confidence,
-                    "warnings":page_warnings,
-                    "annotation_fraction":round(prepared.masks.get("annotation_fraction",0),6)
-                })
-        combined=_join_pages(chunks)
-        combined["pages"]=summaries
-        combined["staff_system_count"]=len(chunks)
-        combined["omr_engine"]="photo-aware-system-v3-staging"
-        combined["needs_review"] = True  # Never treat AI transcription as ground truth.
-        combined["transcription_status"]="estimated_unverified"
+
+        chunks: list[dict] = []
+        summaries: list[dict] = []
+        limit = asyncio.Semaphore(OMR_CONCURRENT_SYSTEMS)
+        max_conn = httpx.Limits(max_connections=OMR_CONCURRENT_SYSTEMS,
+                                max_keepalive_connections=OMR_CONCURRENT_SYSTEMS)
+        request_timeout = httpx.Timeout(OMR_REQUEST_TIMEOUT_SECONDS, connect=8.0)
+
+        async def read_one(*, original_crop, cleaned_crop, page_idx, system_idx,
+                           page_warnings, total_systems, client):
+            async with limit:
+                p = await _gemini_page(
+                    original_crop, page_number=page_idx + 1, exercise=exercise,
+                    client=client,
+                    alternate=cleaned_crop if "colored_handwritten_annotations_detected" in page_warnings else None,
+                    require_second_pass="colored_handwritten_annotations_detected" in page_warnings,
+                    system=system_idx if total_systems > 1 else None,
+                )
+            p["system"] = system_idx
+            p["warnings"] = list(dict.fromkeys([*p.get("warnings", []), *page_warnings]))
+            p["needs_review"] = p["needs_review"] or bool(page_warnings)
+            if system_idx > 1:
+                p["warnings"].append("review_cross_system_bar_or_tie")
+                p["needs_review"] = True
+            return p
+
+        try:
+            async with asyncio.timeout(OMR_TOTAL_TIMEOUT_SECONDS):
+                async with httpx.AsyncClient(timeout=request_timeout, limits=max_conn) as client:
+                    for page_idx in range(len(doc)):
+                        prepared = prepare_pdf_page(doc[page_idx])
+                        original_crops = crop_systems(prepared, "original")
+                        cleaned_crops = crop_systems(prepared, "ink_suppressed")
+                        if len(original_crops) != len(cleaned_crops):
+                            raise HTTPException(status_code=422, detail="omr_staff_crop_mismatch")
+                        if not original_crops:
+                            raise HTTPException(status_code=422, detail="omr_no_staff_detected")
+                        if len(original_crops) > MAX_SYSTEMS_PER_PAGE:
+                            raise HTTPException(status_code=413, detail="Too many staff systems on a page")
+                        page_warnings = list(prepared.warnings)
+                        jobs = [
+                            read_one(
+                                original_crop=img, cleaned_crop=cleaned_crops[idx],
+                                page_idx=page_idx, system_idx=idx + 1,
+                                page_warnings=page_warnings, total_systems=len(original_crops),
+                                client=client,
+                            )
+                            for idx, img in enumerate(original_crops)
+                        ]
+                        # Stop remaining provider requests on the first failed staff.
+                        # This avoids exhausting a free Gemini quota after a 429.
+                        tasks = [asyncio.create_task(job) for job in jobs]
+                        try:
+                            pending = set(tasks)
+                            while pending:
+                                done, pending = await asyncio.wait(
+                                    pending, return_when=asyncio.FIRST_COMPLETED,
+                                )
+                                for task in done:
+                                    error = task.exception()
+                                    if error is not None:
+                                        idx = tasks.index(task)
+                                        if isinstance(error, HTTPException):
+                                            code, status = str(error.detail), error.status_code
+                                        else:
+                                            code, status = "omr_system_failed", 502
+                                        raise HTTPException(
+                                            status_code=status,
+                                            detail={"code": code, "page": page_idx + 1,
+                                                    "system": idx + 1,
+                                                    "retryable": status in (502, 503, 504)},
+                                        ) from error
+                            # Await all tasks in *input* order, never in completion order.
+                            chunks.extend([task.result() for task in tasks])
+                        finally:
+                            for task in tasks:
+                                if not task.done():
+                                    task.cancel()
+                            await asyncio.gather(*tasks, return_exceptions=True)
+                        summaries.append({
+                            "page": page_idx + 1,
+                            "systems": len(original_crops),
+                            "orientation_degrees_ccw": prepared.orientation_degrees,
+                            "rotation_confidence": prepared.rotation_confidence,
+                            "warnings": page_warnings,
+                            "annotation_fraction": round(prepared.masks.get("annotation_fraction", 0), 6),
+                        })
+        except TimeoutError:
+            raise HTTPException(status_code=504, detail={
+                "code": "omr_time_budget_exceeded", "retryable": True,
+                "message": "Try a shorter section; long scores require queued analysis",
+            }) from None
+
+        combined = _join_pages(chunks)
+        combined["pages"] = summaries
+        combined["staff_system_count"] = len(chunks)
+        combined["omr_engine"] = "photo-aware-system-v3-staging"
+        combined["omr_version"] = "3.1"
+        combined["needs_review"] = True
+        combined["transcription_status"] = "estimated_unverified"
         return combined
     finally:
         doc.close()
