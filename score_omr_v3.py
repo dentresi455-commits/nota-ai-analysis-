@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import random
 from typing import Any
 
 import fitz
@@ -195,7 +196,12 @@ async def _gemini_page(img: Image.Image, *, page_number: int, exercise: int | No
     model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
     if not re.fullmatch(r"gemini-[a-zA-Z0-9_.-]+", model):
         raise HTTPException(status_code=503, detail="gemini_model_invalid")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    # Use an explicit, opt-in backup model when an upstream overload occurs.
+    # Do not rotate models on bad credentials or exhausted quota.
+    backup_model = os.getenv("GEMINI_BACKUP_MODEL", "").strip()
+    if backup_model and not re.fullmatch(r"gemini-[a-zA-Z0-9_.-]+", backup_model):
+        raise HTTPException(status_code=503, detail="gemini_backup_model_invalid")
+    overloaded = False
     instruction = PROMPT
     if system is not None:
         instruction += f"\nTranscribe ONLY printed staff system {system} in this cropped image."
@@ -206,6 +212,8 @@ async def _gemini_page(img: Image.Image, *, page_number: int, exercise: int | No
     retry_happened = False
 
     for attempt in range(MAX_PAGE_AI_ATTEMPTS):
+        active_model = backup_model if overloaded and backup_model else model
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{active_model}:generateContent"
         render = img if attempt == 0 else (alternate if alternate is not None else _improve_image(img))
         payload = {
             "contents": [{"parts": [
@@ -226,8 +234,10 @@ async def _gemini_page(img: Image.Image, *, page_number: int, exercise: int | No
             if response.status_code in (408, 500, 502, 503, 504):
                 last_reason = f"gemini_upstream_{response.status_code}"
                 retry_happened = True
+                overloaded = response.status_code in (500, 502, 503, 504)
                 if attempt + 1 < MAX_PAGE_AI_ATTEMPTS:
-                    await asyncio.sleep(0.4)
+                    # Backoff with jitter; stay inside the caller's hard deadline.
+                    await asyncio.sleep(min(4.0, 1.2 * (2 ** attempt)) + random.random() * 0.25)
                 continue
             if response.status_code != 200:
                 raise HTTPException(status_code=502, detail=f"gemini_unexpected_http_{response.status_code}")

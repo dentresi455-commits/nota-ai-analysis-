@@ -1,44 +1,61 @@
-# NOTA AI — OMR Photo v3 (sinov uchun xavfsiz yangilanish)
+# NOTA AI — nota/audio/Gemini va API vaqt cheklovlari uchun sinov yangilanishi
 
-Bu modul foydalanuvchi yuborgan **«Dilnoz»** nota surati ustida tekshirildi. Kod mavjud Render FastAPI repositorysi (`dentresi455-commits/nota-ai-analysis-`) dagi `app.py` uchun mo‘ljallangan. Bu **production deploy emas**; GitHub orqali yozish ruxsati 403 sabab bloklangan.
+**Sana:** 2026-11-25. **Maqsad:** mavjud NOTA AI kodini saqlagan holda 15 daqiqagacha audio bo‘laklash, >300/500 nota hodisalari yo‘qolishini oldini olish, Gemini 503 uchun nazoratli qayta urinish hamda Vercel 60/120 s cheklovini yumshatish.
 
-## Qanday kuchaytirildi?
-- Fotosurat orientatsiyasini besh chiziqli nota geometrik belgilariga qarab tekshirish. Misol suratda 90° burishni topdi. Yuqori/pastki 180° ikkiyoqlamalilik alohida ogohlantiriladi.
-- Mayin deskew va CLAHE yordamida noaniq yoritilgan varaqlarning kontrastini yaxshilash.
-- Muqobil qatlamda ko‘k rangdagi qo‘l yozuvlarini ajratish, **original qora notaga zarar yetkazmasdan** AI qayta tekshiruviga yordam berish.
-- Nota satrlarini aniqlash. «Dilnoz» suratida **6 ta satr** topildi.
-- Satrlar ichidagi takt va notalarni AI orqali JSON formatda o‘qish; dutor barmoq raqamlari **nota deb qabul qilinmasligi** haqida qat’iy ko‘rsatma.
-- Asl va tozalangan ko‘rinishlarning ikki o‘qishi farqlansa, `omr_pass_disagreement` va `needs_review` qo‘yiladi.
-- Satrlar va sahifalar ketma-ketligi, note-onset, davomiylik va takt offsetlarini birlashtirish.
-- Tahlil natijalari **teacher-validated professional score** sifatida belgilab yuborilmaydi.
+## Qanday tekshirildi
 
-## O‘rnatish (faqat staging branch)
-1. `photo_preprocessing.py` va `score_omr_v3.py` ni Render repo ildiziga ko‘chiring.
-2. `requirements.txt` ga `opencv-python-headless>=4.10,<5` qo‘shing. Prod’ga emas, avval stagingda paket va xotira cheklovlarini tekshiring.
-3. `python apply_to_render_app.py app.py` — eski reader qoladi va `app.py.omr-v3-backup` yaratiladi.
-4. `NOTA_OMR_V3_ENABLED=true` — faqat staging; env yoqilmasa ilova **eski o‘qish tizimida qoladi**.
-5. `python -m unittest -v test_score_omr_v2.py test_photo_omr_v3.py`.
-6. Real kalit va autentifikatsiya bilan PDF+audio end-to-end sinovni faqat staging serverda o'tkazing.
+- Haqiqiy `nota-ai-analysis-` repozitoriysining `omr-v3-test-20261121` tarmog‘idagi `app.py`, `advanced_analysis.py`, `score_omr_v3.py` kodiga qarab tuzildi.
+- `score_omr_v3.py` asosining Git blob SHA: `d433af7bdb7bd07525c4b1b13560d1fa4065a1f9` (2026-11-25 kuni tekshirilgan).
+- Avtomatik testlar: **28/28**, shu jumladan 900 sekund davomli audio bilan 500 dan ortiq nota hodisalarini tekshirish va 503→backup model **imitatsiya qilingan** testi.
+- Yangi kod **GitHub’ga/Render’ga/Vercel’ga hali chiqarilmagan**; ChatGPT GitHub integratsiyasi yozishga 403 qaytaryapti. `main` va production versiyalarga tegilmagan.
 
-## Hozircha ishlab turgan saytga kiritilmagani sabablar
-- GitHub connector yangi branch yaratishga uringanda `403 Resource not accessible by integration` qaytardi.
-- Vercel `credit-analysis → nota-render` oqimining Render microservice bilan birlashtirilgani ham alohida end-to-end tasdiqlanishi kerak.
-- 48 sahifagacha bo‘lgan PDFni bitta HTTP so‘rov ichida ketma-ket o‘qish **Vercel/Render timeoutiga olib kelishi mumkin**. Uzun fayllar uchun alohida durable-job navbati, faylni saqlash, progress API va retry tizimi zarur. Shularsiz bu modulni katta asarlar uchun production-ready deb ko‘rsatish noto‘g‘ri.
-- Real nota o‘qish (OMR) sifati boshqa qo‘lda tekshirilgan MusicXML/MIDI namunalarida o‘lchanmagan. Sintetik/mocked testlar aniqlik foizini isbotlamaydi.
+## Nimalar o‘zgaradi
 
-## Fayllar
-- `photo_preprocessing.py` — foto geometry, rangli annotation mask va staff segmentation
-- `score_omr_v3.py` — Gemini bilan satrma-satr transkripsiya va ikki-pass tekshiruv
-- `apply_to_render_app.py` — qaytariladigan, feature flag bilan ulash
-- `test_photo_omr_v3.py`, `test_score_omr_v2.py` — lokal sinovlar
-- `dilnoz_oriented_preview.jpg`, `dilnoz_enhanced_preview.jpg`, `dilnoz_annotation_suppressed_preview.jpg` — sinov surati namunalarining ko‘rinishi
-- `test_results.txt` — test protokoli
+| Muammo | Tuzatish | Muhim cheklov |
+|---|---|---|
+| 500 ta audio hodisasi | `advanced_analysis.py`dagi `events[:500]` olib tashlanadi | Monofonik ovoz aniqligi cheklangan |
+| 300 ta solishtirish | Butun qayd etilgan voqealar bo‘yicha xotira-tejamkor Hirschberg solishtirish va uzoq audio uchun avtomatik 30s bo‘laklar | Juda katta, murakkab ketma-ketliklar xato qaytaradi, taxminiy baho to‘qilmaydi |
+| 900 s audio | `long_audio.py` 30 soniyalik bo‘laklarni qayta ishlaydi, o‘zi o‘tadi, vaqtni tiklaydi | Vercel fayl yuklash/proksi chegarasi alohida |
+| Gemini 503 | Dastlabki 503/5xx uchun jitterli backoff, operator sozlasa backup Gemini modeli | Google serveri yoki kvota sababli xatolarni 100% yo‘qotib bo‘lmaydi |
+| Vercel 60/120 | Marshrutlarning mavjud manba kodida `maxDuration=300`, 220/300 nota parser limiti ko‘tariladi | To‘liq 15 daqiqalik, fondagi tahlil hali tayyor emas |
 
-### Eslatma
-Siz yuborgan suratda oddiy 5 chiziqli nota va uning ustida **barmoq raqamlari** bor. Raqamlarni nota deb o‘qish katta metodik xato. Tizim nota balandligini chiziqlardagi joylashuvga qarab aniqlashi kerak. Nota balandligi, temp/ritm, dutor sozlanishi va oktava masalalarini real audiodan mustaqil tekshirish zarur.
+## Backend’ga qo‘shish — FAQAT STAGING
 
-## Maxfiy surat bilan test
-`qa_private/dilnoz_photo.jpeg` nomiga original suratingizni lokal kiriting;
-bu papka `.gitignore`da va ZIP arxivda **ataylab yo‘q**. Sinovlarda mavjud bo‘lsa
-haqiqiy suratning orientatsiya va satr deteksiyasi ham tekshiriladi.
-Siz yuborgan notani tasodifan umumiy GitHub repositoryga joylashtirish tavsiya etilmaydi.
+GitHub: `dentresi455-commits/nota-ai-analysis-`, tarmoq: `omr-v3-test-20261121`.
+
+1. ZIP ichidagi `backend/long_audio.py`, `backend/long_alignment.py`, `backend/score_omr_v3.py`, `backend/photo_preprocessing.py` fayllarini ushbu repozitoriyning **ildiz papkasiga** joylang. Ular `app.py` bilan yonma-yon turadi.
+2. `backend/apply_backend_patch.py` faylini sinov tarmog‘iga qo‘shing. GitHub Codespaces terminali yoki mahalliy Python bilan repozitoriy ildizida `python3 apply_backend_patch.py .` buyrug‘ini bajaring. Skript `app.py` hamda `advanced_analysis.py` ni avtomatik tekshirib, backup yaratadi va ikki flag orqali yangi modullarni ulaydi.
+3. Staging Render servisida environment variables:
+   - `NOTA_LONG_AUDIO_ENABLED=true`
+   - `NOTA_FULL_ALIGNMENT_ENABLED=true`
+   - `NOTA_OMR_V3_ENABLED=true`
+   - `NOTA_MAX_AUDIO_SECONDS=900`
+   - `GEMINI_BACKUP_MODEL=` **faqat Google loyihangizda ruxsat etilgan, sinovdan o‘tgan model nomi**; bo‘sh qoldirish mumkin.
+4. `GEMINI_API_KEY` va `NOTA_API_TOKEN` ni o‘zgartirmang, chatga yubormang.
+5. GitHub staging commit saqlangandan keyin Render staging’da manual Deploy → Deploy latest commit ni bajaring (yoki ChatGPT’dan deployni boshlashni so‘rang). `main` uchun emas.
+6. Test: real 3 daqiqa, 10 daqiqa, 15 daqiqa audio hamda foto PDF. Natijada `audio.duration_seconds`, `audio.total_detected_events`, `comparison.reference_count` va `comparison.performed_count` ni ko‘rib, hech qanday kesilish yo‘qligini tekshiring.
+7. `comparison` faqat aniqlangan bir ovozli tovushlarning taxminiy mosligini beradi. Ritm/temp va pedagogik professional ball ishonchli dalilsiz chiqarilmaydi. Agar `Long alignment needs background batch processing` xatosi chiqsa, bu ongli cheklov — tizim natija uydirmaydi.
+
+## Vercel marshrutlariga qo‘shish — FAQAT TO‘LIQ NEXT.JS SOURCE TOPILGANDA
+
+GitHub’dagi `ohang-ai-video` repozitoriysi hozir to‘liq Next.js loyihasi emas. `vercel/apply_vercel_patch.py` ni **u yerda ishga tushirmang**. Uni faqat asl Next.js kodining mavjud `src/app/api/nota-render/route.js`, `src/app/api/credit-analysis/route.js`, `src/app/api/score-compare/route.js` marshrutlari yonida ishlating:
+
+```
+python3 vercel/apply_vercel_patch.py .
+npm test
+npm run build
+```
+
+Skript mavjud kod belgilarini tekshiradi, avvalgi fayllarga tegishdan oldin hammasi mosligini tekshiradi, keyin backup yaratadi. `maxDuration` 300s bo‘lishi deploy platforma plan/Fluid Compute cheklovlariga bog‘liq. Boshqa ichki `AbortController` timeoutlari va 96 MB fayl yuklash bundan alohida. Hozirgi sinxron endpoint 15 daqiqa davom etadigan bir so‘rovga yetarli emas; ishonchli yechim: **private object storage + persistent queue/worker + status polling + idempotent kredit hisoblash**. Shu arxitekturani kredit tizimi kodi to‘liq ko‘rilmasdan production’da qo‘shmang.
+
+## Rollback
+
+- Backend: `app.py.nota-backup` va `advanced_analysis.py.nota-backup` fayllarini qaytaring; eski versiyaga qaytish uchun `NOTA_LONG_AUDIO_ENABLED=false`, `NOTA_FULL_ALIGNMENT_ENABLED=false` qiling.
+- Vercel: `route.js.nota-backup` fayllarini qaytaring; production loyiha o‘zgartirilmagan.
+- Render’da eski muvaffaqiyatli deployni tiklash mumkin; production’ga chiqarishdan avval kredit va login regression sinovlari majburiy.
+
+## Ehtiyotkorlik
+
+- Ayni paytda 28 avtomatik test **haqiqiy Gemini endpointi orqali yakuniy muvaffaqiyatli transkripsiya** bo‘lganini bildirmaydi; AI javoblari nazorat testlarida imitasiya qilindi.
+- OMR 52 soniyali vaqt limitida 48 sahifani qayta ishlay olmaydi; ko‘p sahifali nota uchun barqaror background worker kerak.
+- Vercel source to‘liq tiklanmaganligi sabab patchni saytga avtomatik chiqarib bo‘lmadi.
