@@ -26,7 +26,7 @@ except ImportError:
     pass
 
 app = FastAPI(title="NOTA AI Analysis", version="0.9.0")
-MAX_PDF = 8 * 1024 * 1024
+MAX_PDF = (32 if os.getenv("NOTA_OMR_V3_ENABLED", "false").lower() == "true" else 8) * 1024 * 1024
 MAX_AUDIO = 96 * 1024 * 1024
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".tif", ".tiff", ".bmp"}
 VIDEO_EXT = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"}
@@ -187,6 +187,11 @@ def compare_notes(expected, actual):
             "detailed_feedback": detailed_note_feedback(expected, actual),
             "rhythm_scored": False,
             "warning": "Approximate melody pitch matching; not a certified performance assessment."}
+
+
+# Exact, memory-bounded whole-sequence alignment, staging opt-in.
+if os.getenv("NOTA_FULL_ALIGNMENT_ENABLED", "false").lower() == "true":
+    from long_alignment import compare_complete as compare_notes
 
 
 @app.get("/health")
@@ -377,6 +382,11 @@ def audio_to_notes(raw, filename):
             "timing_status":"estimated_from_monophonic_audio" if events else "not_available",
             "duration_seconds": round(len(samples) / rate, 2),
             "method": "spectral dominant pitch (monophonic approximation)"}
+
+
+# NOTA long audio: explicit staging opt-in; fallback remains untouched.
+if os.getenv("NOTA_LONG_AUDIO_ENABLED", "false").lower() == "true":
+    from long_audio import audio_to_notes
 
 
 @app.get("/v1/instruments")
