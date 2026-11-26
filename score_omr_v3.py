@@ -32,9 +32,19 @@ MAX_SYSTEMS_PER_PAGE = 12
 
 # Bounded synchronous preview. Large scores need a durable background job queue.
 # Do not increase the timeout beyond the calling frontend/proxy's limit.
-OMR_TOTAL_TIMEOUT_SECONDS = 52
-OMR_REQUEST_TIMEOUT_SECONDS = 20
-OMR_CONCURRENT_SYSTEMS = max(1, min(3, int(os.getenv("NOTA_OMR_CONCURRENT_SYSTEMS", "2"))))
+def _bounded_int(name, default, low, high):
+    try:
+        return max(low, min(high, int(os.getenv(name, str(default)))))
+    except (TypeError, ValueError):
+        return default
+
+
+# Keep the previous default for compatibility with the synchronous web proxy.
+# Direct staging tests can explicitly request a larger budget, up to 240s.
+OMR_TOTAL_TIMEOUT_SECONDS = _bounded_int("NOTA_OMR_TOTAL_TIMEOUT_SECONDS", 52, 30, 240)
+OMR_REQUEST_TIMEOUT_SECONDS = _bounded_int("NOTA_OMR_REQUEST_TIMEOUT_SECONDS", 20, 8, 45)
+OMR_FALLBACK_TIMEOUT_SECONDS = _bounded_int("NOTA_OMR_FALLBACK_TIMEOUT_SECONDS", 15, 5, 45)
+OMR_CONCURRENT_SYSTEMS = _bounded_int("NOTA_OMR_CONCURRENT_SYSTEMS", 2, 1, 3)
 
 PROMPT = """You are a careful optical music transcription specialist.
 Transcribe ONE page of a conventional printed music score from left to right,
@@ -63,6 +73,11 @@ set needs_review true and warn "polyphony" or "chord_not_supported".
 If the score has repeats, da capo, dal segno or volta markers, do NOT expand
 them without structural verification; record a warning "repeat_structure".
 Do not infer actual concert tuning of a transposing dutor from the staff alone.
+Before returning, check the clef and key signature, count printed note attacks
+across every visible measure, and verify that the first and last readable notes
+are included. Keep repeats and uncertain ties flagged; never fill a gap with a
+plausible invented note. If the crop is unreadable or appears incomplete,
+flag needs_review and add a warning; do not claim a complete verified reading.
 
 """
 
@@ -174,6 +189,8 @@ def _validated_page(data: Any, page_number: int) -> dict:
         raise ValueError("pitches_do_not_match_events")
     if not notes:
         raise ValueError("no_reliable_notes")
+    if len(notes) > MAX_NOTES:
+        raise ValueError("too_many_notes")
     confidence = str(data.get("confidence", "low")).lower()
     if confidence not in {"high", "medium", "low"}:
         confidence = "low"
@@ -186,7 +203,7 @@ def _validated_page(data: Any, page_number: int) -> dict:
             "needs_review":needs_review,"warnings":warnings}
 
 
-# NOTA_OMR_FALLBACK_V1: opt-in third-party vision fallback for repeated Gemini 5xx.
+# NOTA_OMR_FALLBACK_V2: opt-in independent vision fallback for provider failures.
 # Third-party requests MUST be explicitly enabled in Render staging. Provider
 # keys and model IDs must be configured there; no credentials are embedded here.
 async def _optional_vision_fallback(img: Image.Image, instruction: str,
@@ -194,11 +211,10 @@ async def _optional_vision_fallback(img: Image.Image, instruction: str,
                                     failed_reason: str) -> dict | None:
     if os.getenv("NOTA_ENABLE_VISION_FALLBACK", "false").lower() != "true":
         return None
-    data_url = "data:image/png;base64," + _to_png_base64(img)
-    content = [
-        {"type": "text", "text": instruction},
-        {"type": "image_url", "image_url": {"url": data_url}},
-    ]
+    data_url = None
+    content = None
+    # Encode only if a configured provider is actually available.
+    # This avoids CPU work on every failed Gemini call.
     providers = [
         ("openrouter", "OPENROUTER_API_KEY", "NOTA_OPENROUTER_VISION_MODEL",
          "https://openrouter.ai/api/v1/chat/completions"),
@@ -210,6 +226,12 @@ async def _optional_vision_fallback(img: Image.Image, instruction: str,
         # Never guess a provider/model.  Skip unavailable or improperly configured.
         if not api_key or not model or len(model) > 150 or not re.fullmatch(r"[a-zA-Z0-9_.:/-]+", model):
             continue
+        if content is None:
+            data_url = "data:image/png;base64," + _to_png_base64(img)
+            content = [
+                {"type": "text", "text": instruction},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ]
         try:
             response = await client.post(
                 url,
@@ -218,13 +240,17 @@ async def _optional_vision_fallback(img: Image.Image, instruction: str,
                 json={"model": model,
                       "messages": [{"role": "user", "content": content}],
                       "temperature": 0, "max_tokens": 4096},
-                timeout=15,
+                timeout=OMR_FALLBACK_TIMEOUT_SECONDS,
             )
             # Fail closed for auth, unsupported model, quota or provider outage.
             if response.status_code != 200:
                 continue
             payload = response.json()
-            message = payload["choices"][0]["message"]["content"]
+            choice = payload["choices"][0]
+            # A token-limited or filtered result may be incomplete even if it parses.
+            if choice.get("finish_reason") not in (None, "stop"):
+                continue
+            message = choice["message"]["content"]
             if isinstance(message, list):
                 message = "".join(p.get("text", "") for p in message if isinstance(p, dict))
             if not isinstance(message, str):
@@ -235,7 +261,7 @@ async def _optional_vision_fallback(img: Image.Image, instruction: str,
             result["needs_review"] = True
             result["warnings"] = list(dict.fromkeys([
                 *result["warnings"], "vision_fallback_used_" + name,
-                "gemini_retryable_failure", "fallback_requires_teacher_review",
+                failed_reason, "fallback_requires_teacher_review",
             ]))
             return result
         except (httpx.HTTPError, ValueError, KeyError, TypeError, IndexError):
@@ -247,23 +273,27 @@ async def _gemini_page(img: Image.Image, *, page_number: int, exercise: int | No
                        client: httpx.AsyncClient, alternate: Image.Image | None = None,
                        require_second_pass: bool = False, system: int | None = None) -> dict:
     """Read one cropped staff; provider errors are explicit and never become scores."""
-    key = os.getenv("GEMINI_API_KEY")
-    if not key:
-        raise HTTPException(status_code=503, detail="gemini_key_missing")
+    key = os.getenv("GEMINI_API_KEY", "").strip()
     model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-    if not re.fullmatch(r"gemini-[a-zA-Z0-9_.-]+", model):
-        raise HTTPException(status_code=503, detail="gemini_model_invalid")
-    # Use an explicit, opt-in backup model when an upstream overload occurs.
-    # Do not rotate models on bad credentials or exhausted quota.
     backup_model = os.getenv("GEMINI_BACKUP_MODEL", "").strip()
-    if backup_model and not re.fullmatch(r"gemini-[a-zA-Z0-9_.-]+", backup_model):
-        raise HTTPException(status_code=503, detail="gemini_backup_model_invalid")
     overloaded = False
     instruction = PROMPT
     if system is not None:
-        instruction += f"\nTranscribe ONLY printed staff system {system} in this cropped image."
+        instruction += f"\nThis image is a crop of staff system {system}. Read only visible notes, use local onset 0 and local bar numbering; do not reconstruct other systems."
     if exercise is not None:
         instruction += f"\nOnly exercise number {exercise}; ignore other exercises."
+    config_error = None
+    if not key:
+        config_error = "gemini_key_missing"
+    elif not re.fullmatch(r"gemini-[a-zA-Z0-9_.-]+", model):
+        config_error = "gemini_model_invalid"
+    elif backup_model and not re.fullmatch(r"gemini-[a-zA-Z0-9_.-]+", backup_model):
+        config_error = "gemini_backup_model_invalid"
+    if config_error:
+        result = await _optional_vision_fallback(img, instruction, page_number, client, config_error)
+        if result is not None:
+            return result
+        raise HTTPException(status_code=503, detail=config_error)
     last_reason = "invalid_response"
     retryable_upstream_failure = False
     first_valid = None
@@ -301,7 +331,10 @@ async def _gemini_page(img: Image.Image, *, page_number: int, exercise: int | No
             if response.status_code != 200:
                 raise HTTPException(status_code=502, detail=f"gemini_unexpected_http_{response.status_code}")
             body = response.json()
-            response_text = "".join(p.get("text", "") for p in body["candidates"][0]["content"]["parts"])
+            candidate = body["candidates"][0]
+            if candidate.get("finishReason") not in (None, "STOP"):
+                raise ValueError("gemini_incomplete_response")
+            response_text = "".join(p.get("text", "") for p in candidate["content"]["parts"])
             try:
                 obj = json.loads(response_text)
             except json.JSONDecodeError:
@@ -333,8 +366,17 @@ async def _gemini_page(img: Image.Image, *, page_number: int, exercise: int | No
             chosen["warnings"].append("confirmed_pitch_sequence_by_second_pass")
             chosen["needs_review"] = bool(first_valid["needs_review"] or result["needs_review"])
             return chosen
-        except HTTPException:
-            # Invalid credentials/model/quota are fatal: do not suppress them.
+        except HTTPException as error:
+            # Do not retry unauthorized/quota-limited Gemini. Preserve any
+            # valid first reading and clearly mark the failed verification.
+            if first_valid is not None:
+                first_valid["warnings"].append("recheck_unavailable_" + str(error.detail))
+                first_valid["needs_review"] = True
+                first_valid["confidence"] = "low"
+                return first_valid
+            result = await _optional_vision_fallback(img, instruction, page_number, client, str(error.detail))
+            if result is not None:
+                return result
             raise
         except (httpx.TimeoutException, httpx.TransportError):
             last_reason = "gemini_timeout_or_network"
@@ -349,7 +391,7 @@ async def _gemini_page(img: Image.Image, *, page_number: int, exercise: int | No
         first_valid["needs_review"] = True
         first_valid["confidence"] = "low"
         return first_valid
-    if retryable_upstream_failure:
+    if retryable_upstream_failure or last_reason == "gemini_invalid_response":
         backup_result = await _optional_vision_fallback(
             img, instruction, page_number, client, last_reason)
         if backup_result is not None:
@@ -513,7 +555,7 @@ async def pdf_to_notes(data: bytes, exercise: int | None = None) -> dict:
         combined["pages"] = summaries
         combined["staff_system_count"] = len(chunks)
         combined["omr_engine"] = "photo-aware-system-v3-staging"
-        combined["omr_version"] = "3.1"
+        combined["omr_version"] = "3.2"
         combined["needs_review"] = True
         combined["transcription_status"] = "estimated_unverified"
         return combined
