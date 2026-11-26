@@ -44,7 +44,7 @@ def _bounded_int(name, default, low, high):
 OMR_TOTAL_TIMEOUT_SECONDS = _bounded_int("NOTA_OMR_TOTAL_TIMEOUT_SECONDS", 52, 30, 240)
 OMR_REQUEST_TIMEOUT_SECONDS = _bounded_int("NOTA_OMR_REQUEST_TIMEOUT_SECONDS", 20, 8, 45)
 OMR_FALLBACK_TIMEOUT_SECONDS = _bounded_int("NOTA_OMR_FALLBACK_TIMEOUT_SECONDS", 15, 5, 45)
-OMR_CONCURRENT_SYSTEMS = _bounded_int("NOTA_OMR_CONCURRENT_SYSTEMS", 2, 1, 3)
+OMR_CONCURRENT_SYSTEMS = 1
 
 PROMPT = """You are a careful optical music transcription specialist.
 Transcribe ONE page of a conventional printed music score from left to right,
@@ -490,7 +490,9 @@ async def pdf_to_notes(data: bytes, exercise: int | None = None) -> dict:
                     for page_idx in range(len(doc)):
                         prepared = prepare_pdf_page(doc[page_idx])
                         original_crops = crop_systems(prepared, "original")
-                        cleaned_crops = crop_systems(prepared, "ink_suppressed")
+                        cleaned_crops = (crop_systems(prepared, "ink_suppressed")
+                                         if "colored_handwritten_annotations_detected" in prepared.warnings
+                                         else original_crops)
                         if len(original_crops) != len(cleaned_crops):
                             raise HTTPException(status_code=422, detail="omr_staff_crop_mismatch")
                         if not original_crops:
@@ -545,6 +547,9 @@ async def pdf_to_notes(data: bytes, exercise: int | None = None) -> dict:
                             "warnings": page_warnings,
                             "annotation_fraction": round(prepared.masks.get("annotation_fraction", 0), 6),
                         })
+                        # Release page and crop images before decoding the next page.
+                        del jobs, tasks, original_crops, cleaned_crops, prepared
+                        fitz.TOOLS.store_shrink(100)
         except TimeoutError:
             raise HTTPException(status_code=504, detail={
                 "code": "omr_time_budget_exceeded", "retryable": True,

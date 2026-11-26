@@ -1,4 +1,5 @@
 import base64
+import asyncio
 import json
 import math
 import os
@@ -26,7 +27,9 @@ try:
 except ImportError:
     pass
 
-app = FastAPI(title="NOTA AI Analysis", version="0.9.1")
+app = FastAPI(title="NOTA AI Analysis", version="0.9.2")
+# Reject concurrent heavy jobs rather than accumulating uploads in RAM.
+_ANALYSIS_LOCK = asyncio.Lock()
 MAX_PDF = (32 if os.getenv("NOTA_OMR_V3_ENABLED", "false").lower() == "true" else 8) * 1024 * 1024
 MAX_AUDIO = 96 * 1024 * 1024
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".tif", ".tiff", ".bmp"}
@@ -262,6 +265,14 @@ def normalize_score(raw, filename):
         with Image.open(io.BytesIO(raw)) as img:
             if img.width * img.height > 24_000_000:
                 raise HTTPException(413, "Image dimensions too large")
+            from photo_preprocessing import bounded_size
+            target = bounded_size(*img.size)
+            if target != img.size:
+                if img.format == "JPEG":
+                    img.draft("RGB", target)
+                target = bounded_size(*img.size)
+                if target != img.size:
+                    img = img.resize(target, Image.Resampling.LANCZOS)
             rgb = ImageOps.exif_transpose(img).convert("RGB")
             output = io.BytesIO()
             rgb.save(output, format="PDF", resolution=150)
@@ -410,57 +421,60 @@ async def analyze_files(score: UploadFile = File(...), audio: UploadFile = File(
                         beats_per_measure: Optional[int] = Form(None),
                         instrument: Optional[str] = Form(None)):
     authorize(authorization)
-    profile = get_instrument(instrument)
-    if instrument is not None and profile is None:
-        raise HTTPException(422, "Unknown instrument. See GET /v1/instruments")
-    if exercise is not None and not 1 <= exercise <= 99:
-        raise HTTPException(422, "Exercise must be between 1 and 99")
-    if bpm is not None and not 20 <= bpm <= 300:
-        raise HTTPException(422,"BPM must be 20..300")
-    if beats_per_measure is not None and not 1 <= beats_per_measure <= 12:
-        raise HTTPException(422,"beats_per_measure must be 1..12")
-    pdf_bytes = await read_limited(score, MAX_PDF)
-    audio_bytes = await read_limited(audio, MAX_AUDIO)
-    normalized_score, score_type = await run_in_threadpool(normalize_score, pdf_bytes, score.filename)
-    if os.getenv("NOTA_OMR_V3_ENABLED", "false").lower() == "true":
-        from score_omr_v3 import pdf_to_notes as pdf_to_notes_v3
-        score_data = await pdf_to_notes_v3(normalized_score, exercise)
-    else:
-        score_data = await pdf_to_notes(normalized_score, exercise)
-    audio_data = await run_in_threadpool(audio_to_notes, audio_bytes, audio.filename)
-    result = await run_in_threadpool(compare_notes, score_data["notes"], audio_data["notes"])
-    report = professional_report(result, score_data, audio_data)
-    guidance = instrument_guidance(profile)
-    report["instrument_guidance"] = guidance
-    timed=None
-    grade={"status":"insufficient_evidence","technical_score_100":None,"professional_score_100":None}
-    if bpm and score_data.get("events") and audio_data.get("events"):
-        try:
-            reference=[Event(midi=e["midi"],start=e["onset_beats"]*60/bpm,
-                             duration=e["duration_beats"]*60/bpm) for e in score_data["events"]]
-            performed=[Event(midi=e["midi"],start=e["start"],duration=e["duration"])
-                       for e in audio_data["events"]]
-            timed=await run_in_threadpool(analyze,reference,performed,60/bpm,beats_per_measure)
-            grade=technical_score(timed,score_confidence=score_data["confidence"],
-                                  audio_events=audio_data["events"])
-        except ValueError as error:
-            report["measurement_limitations"].append("Timed analysis unavailable: " + str(error))
-    if timed is not None:
-        report["sections"]["baholash_mezonlari"]["ritm"] = timed["rhythm"]
-        report["sections"]["baholash_mezonlari"]["temp"] = timed["tempo"]
-        report["timed_errors"] = timed["note_errors"]
-        report["sections"]["umumiy_xulosa"] += (
-            " Ritm va temp natijalari dastlabki hisoblangan baholar bo‘lib, "
-            "professional tekshiruvdan o‘tmagan."
-        )
-    return {"score": score_data, "score_input_type": score_type, "audio": audio_data,
-            "comparison": result, "professional_report": report,
-            "selected_instrument": profile["id"] if profile else None,
-            "instrument_guidance": guidance,
-            "timed_analysis":timed,"technical_grading":grade,
-            "professional_grading":professional_grade({}),
-            "limitations": ["Monophonic melody only", "No verified rhythm assessment",
-                            "AI sheet-music extraction may be inaccurate",
-                            "Instrument harmonics may affect pitch detection",
-                            "Video is assessed from its extracted audio only",
-                            "File accepted does not guarantee accurate transcription"]}
+    if _ANALYSIS_LOCK.locked():
+        raise HTTPException(503, "analysis_busy_retry_later", headers={"Retry-After": "10"})
+    async with _ANALYSIS_LOCK:
+        profile = get_instrument(instrument)
+        if instrument is not None and profile is None:
+            raise HTTPException(422, "Unknown instrument. See GET /v1/instruments")
+        if exercise is not None and not 1 <= exercise <= 99:
+            raise HTTPException(422, "Exercise must be between 1 and 99")
+        if bpm is not None and not 20 <= bpm <= 300:
+            raise HTTPException(422,"BPM must be 20..300")
+        if beats_per_measure is not None and not 1 <= beats_per_measure <= 12:
+            raise HTTPException(422,"beats_per_measure must be 1..12")
+        pdf_bytes = await read_limited(score, MAX_PDF)
+        audio_bytes = await read_limited(audio, MAX_AUDIO)
+        normalized_score, score_type = await run_in_threadpool(normalize_score, pdf_bytes, score.filename)
+        if os.getenv("NOTA_OMR_V3_ENABLED", "false").lower() == "true":
+            from score_omr_v3 import pdf_to_notes as pdf_to_notes_v3
+            score_data = await pdf_to_notes_v3(normalized_score, exercise)
+        else:
+            score_data = await pdf_to_notes(normalized_score, exercise)
+        audio_data = await run_in_threadpool(audio_to_notes, audio_bytes, audio.filename)
+        result = await run_in_threadpool(compare_notes, score_data["notes"], audio_data["notes"])
+        report = professional_report(result, score_data, audio_data)
+        guidance = instrument_guidance(profile)
+        report["instrument_guidance"] = guidance
+        timed=None
+        grade={"status":"insufficient_evidence","technical_score_100":None,"professional_score_100":None}
+        if bpm and score_data.get("events") and audio_data.get("events"):
+            try:
+                reference=[Event(midi=e["midi"],start=e["onset_beats"]*60/bpm,
+                                 duration=e["duration_beats"]*60/bpm) for e in score_data["events"]]
+                performed=[Event(midi=e["midi"],start=e["start"],duration=e["duration"])
+                           for e in audio_data["events"]]
+                timed=await run_in_threadpool(analyze,reference,performed,60/bpm,beats_per_measure)
+                grade=technical_score(timed,score_confidence=score_data["confidence"],
+                                      audio_events=audio_data["events"])
+            except ValueError as error:
+                report["measurement_limitations"].append("Timed analysis unavailable: " + str(error))
+        if timed is not None:
+            report["sections"]["baholash_mezonlari"]["ritm"] = timed["rhythm"]
+            report["sections"]["baholash_mezonlari"]["temp"] = timed["tempo"]
+            report["timed_errors"] = timed["note_errors"]
+            report["sections"]["umumiy_xulosa"] += (
+                " Ritm va temp natijalari dastlabki hisoblangan baholar bo‘lib, "
+                "professional tekshiruvdan o‘tmagan."
+            )
+        return {"score": score_data, "score_input_type": score_type, "audio": audio_data,
+                "comparison": result, "professional_report": report,
+                "selected_instrument": profile["id"] if profile else None,
+                "instrument_guidance": guidance,
+                "timed_analysis":timed,"technical_grading":grade,
+                "professional_grading":professional_grade({}),
+                "limitations": ["Monophonic melody only", "No verified rhythm assessment",
+                                "AI sheet-music extraction may be inaccurate",
+                                "Instrument harmonics may affect pitch detection",
+                                "Video is assessed from its extracted audio only",
+                                "File accepted does not guarantee accurate transcription"]}
