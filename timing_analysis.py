@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Optional
 import math
 import statistics
+import os
+from long_alignment import _align, _small_align
 
 @dataclass(frozen=True)
 class Event:
@@ -14,8 +16,8 @@ class Event:
     duration: float
 
 def validate(events):
-    if not 1 <= len(events) <= 500:
-        raise ValueError("Expected 1..500 note events")
+    if not 1 <= len(events) <= 12000:
+        raise ValueError("Expected 1..12000 note events")
     for e in events:
         if not (21 <= e.midi <= 108 and math.isfinite(e.start)
                 and math.isfinite(e.duration) and e.start >= 0 and e.duration > 0):
@@ -28,39 +30,42 @@ def align(reference, performed):
     """Needleman-Wunsch: note matches favored; timestamps remain evidence only."""
     validate(reference)
     validate(performed)
-    n, m = len(reference), len(performed)
-    dp = [[0]*(m+1) for _ in range(n+1)]
-    for i in range(n+1): dp[i][0] = i
-    for j in range(m+1): dp[0][j] = j
-    for i in range(1, n+1):
-        for j in range(1, m+1):
-            cost = min(1, abs(reference[i-1].midi-performed[j-1].midi))
-            dp[i][j] = min(dp[i-1][j]+1, dp[i][j-1]+1, dp[i-1][j-1]+cost)
-    i,j=n,m
-    pairs=[]
-    errors=[]
-    while i or j:
-        if i and j and dp[i][j]==dp[i-1][j-1]+min(1,abs(reference[i-1].midi-performed[j-1].midi)):
-            a,b=reference[i-1],performed[j-1]
-            pairs.append((i-1,j-1))
-            if a.midi!=b.midi:
-                errors.append({"kind":"wrong_pitch","reference_note":i,
-                               "audio_time_seconds":round(b.start,3),
-                               "expected_midi":a.midi,"actual_midi":b.midi,
-                               "semitones":b.midi-a.midi})
-            i-=1;j-=1
-        elif i and dp[i][j]==dp[i-1][j]+1:
-            errors.append({"kind":"missing_note","reference_note":i,
-                           "expected_midi":reference[i-1].midi})
-            i-=1
+    a = [e.midi for e in reference]
+    b = [e.midi for e in performed]
+    n, m = len(a), len(b)
+    # Preserve the old tie-break order for short inputs, and use exact
+    # Hirschberg alignment for long inputs (no quadratic memory matrix).
+    leading = 0
+    while leading < min(n, m) and a[leading] == b[leading]:
+        leading += 1
+    trailing = 0
+    while trailing < min(n, m) - leading and a[-trailing-1] == b[-trailing-1]:
+        trailing += 1
+    try:
+        max_cells = int(os.getenv("NOTA_MAX_ALIGNMENT_CELLS", "24000000"))
+    except ValueError:
+        max_cells = 24000000
+    max_cells = max(1, min(max_cells, 24000000))
+    if (n-leading-trailing)*(m-leading-trailing) > max_cells:
+        raise ValueError("Long alignment requires queued processing")
+    ops = _small_align(a, b, 0, 0) if max(n, m) <= 500 else _align(a, b)
+    pairs, errors = [], []
+    for tag, i, j in ops:
+        if tag in ("match", "replace"):
+            pairs.append((i,j))
+            if tag == "replace":
+                errors.append({"kind":"wrong_pitch","reference_note":i+1,
+                               "audio_time_seconds":round(performed[j].start,3),
+                               "expected_midi":a[i],"actual_midi":b[j],
+                               "semitones":b[j]-a[i]})
+        elif tag == "delete":
+            errors.append({"kind":"missing_note","reference_note":i+1,
+                           "expected_midi":a[i]})
         else:
-            b=performed[j-1]
-            errors.append({"kind":"extra_note","audio_time_seconds":round(b.start,3),
-                           "actual_midi":b.midi})
-            j-=1
-    pairs.reverse()
-    errors.reverse()
-    return pairs,errors,dp[n][m]
+            errors.append({"kind":"extra_note","audio_time_seconds":round(performed[j].start,3),
+                           "actual_midi":b[j]})
+    return pairs, errors, len(errors)
+
 
 def analyze(reference,performed,beat_seconds=None,time_signature_numerator=None):
     """Reference and performance times must be actual measured/verified seconds."""

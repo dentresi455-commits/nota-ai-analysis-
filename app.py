@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import io
 from typing import Optional
+from starlette.concurrency import run_in_threadpool
 from timing_analysis import Event, analyze
 from advanced_analysis import extract_events, technical_score
 from professional_grading import grade as professional_grade
@@ -25,9 +26,9 @@ try:
 except ImportError:
     pass
 
-app = FastAPI(title="NOTA AI Analysis", version="0.9.0")
-MAX_PDF = 8 * 1024 * 1024
-MAX_AUDIO = 24 * 1024 * 1024
+app = FastAPI(title="NOTA AI Analysis", version="0.9.1")
+MAX_PDF = (32 if os.getenv("NOTA_OMR_V3_ENABLED", "false").lower() == "true" else 8) * 1024 * 1024
+MAX_AUDIO = 96 * 1024 * 1024
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".tif", ".tiff", ".bmp"}
 VIDEO_EXT = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"}
 AUDIO_EXT = {".wav", ".mp3", ".m4a", ".ogg", ".flac", ".webm", ".aac"}
@@ -39,9 +40,13 @@ def authorize(value):
         raise HTTPException(401, "API token is missing or invalid")
 
 
+# Keep the small legacy limit unless linear-memory alignment is explicitly on.
+COMPARE_LIMIT = 12000 if os.getenv("NOTA_FULL_ALIGNMENT_ENABLED", "false").lower() == "true" else 1000
+
+
 class CompareRequest(BaseModel):
-    reference_midi: list[int] = Field(min_length=1, max_length=1000)
-    performed_hz: list[float] = Field(min_length=1, max_length=1000)
+    reference_midi: list[int] = Field(min_length=1, max_length=COMPARE_LIMIT)
+    performed_hz: list[float] = Field(min_length=1, max_length=COMPARE_LIMIT)
 
 
 def detailed_note_feedback(expected, actual):
@@ -189,10 +194,18 @@ def compare_notes(expected, actual):
             "warning": "Approximate melody pitch matching; not a certified performance assessment."}
 
 
+# Exact, memory-bounded whole-sequence alignment, staging opt-in.
+if os.getenv("NOTA_FULL_ALIGNMENT_ENABLED", "false").lower() == "true":
+    from long_alignment import compare_complete as compare_notes
+
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "0.9.0",
-            "pdf_ai_configured": bool(os.getenv("GEMINI_API_KEY"))}
+    return {"status": "ok", "version": "0.9.1",
+            "pdf_ai_configured": bool(os.getenv("GEMINI_API_KEY")),
+            "omr_v3_enabled": os.getenv("NOTA_OMR_V3_ENABLED", "false").lower() == "true",
+            "long_audio_enabled": os.getenv("NOTA_LONG_AUDIO_ENABLED", "false").lower() == "true",
+            "full_alignment_enabled": os.getenv("NOTA_FULL_ALIGNMENT_ENABLED", "false").lower() == "true"}
 
 
 
@@ -202,8 +215,8 @@ class TimedNote(BaseModel):
     duration: float = Field(gt=0)
 
 class TimedAnalysisRequest(BaseModel):
-    reference: list[TimedNote] = Field(min_length=1, max_length=500)
-    performed: list[TimedNote] = Field(min_length=1, max_length=500)
+    reference: list[TimedNote] = Field(min_length=1, max_length=12000)
+    performed: list[TimedNote] = Field(min_length=1, max_length=12000)
     beat_seconds: Optional[float] = Field(default=None, gt=0)
     time_signature_numerator: Optional[int] = Field(default=None, ge=1, le=12)
 
@@ -329,10 +342,10 @@ def audio_to_notes(raw, filename):
         path = os.path.join(folder, "input" + ext)
         with open(path, "wb") as f:
             f.write(raw)
-        command = ["ffmpeg", "-v", "error", "-nostdin", "-i", path, "-t", "90",
+        command = ["ffmpeg", "-v", "error", "-nostdin", "-i", path, "-t", "900",
                    "-ac", "1", "-ar", "16000", "-f", "wav", os.path.join(folder, "audio.wav")]
         try:
-            proc = subprocess.run(command, capture_output=True, timeout=25)
+            proc = subprocess.run(command, capture_output=True, timeout=180)
         except (FileNotFoundError, subprocess.TimeoutExpired):
             raise HTTPException(503, "Audio converter unavailable")
         if proc.returncode:
@@ -379,6 +392,11 @@ def audio_to_notes(raw, filename):
             "method": "spectral dominant pitch (monophonic approximation)"}
 
 
+# NOTA long audio: explicit staging opt-in; fallback remains untouched.
+if os.getenv("NOTA_LONG_AUDIO_ENABLED", "false").lower() == "true":
+    from long_audio import audio_to_notes
+
+
 @app.get("/v1/instruments")
 def list_instruments():
     return {"count": len(INSTRUMENTS), "instruments": list(INSTRUMENTS.values())}
@@ -397,32 +415,36 @@ async def analyze_files(score: UploadFile = File(...), audio: UploadFile = File(
         raise HTTPException(422, "Unknown instrument. See GET /v1/instruments")
     if exercise is not None and not 1 <= exercise <= 99:
         raise HTTPException(422, "Exercise must be between 1 and 99")
+    if bpm is not None and not 20 <= bpm <= 300:
+        raise HTTPException(422,"BPM must be 20..300")
+    if beats_per_measure is not None and not 1 <= beats_per_measure <= 12:
+        raise HTTPException(422,"beats_per_measure must be 1..12")
     pdf_bytes = await read_limited(score, MAX_PDF)
     audio_bytes = await read_limited(audio, MAX_AUDIO)
-    normalized_score, score_type = normalize_score(pdf_bytes, score.filename)
-    score_data = await pdf_to_notes(normalized_score, exercise)
-    audio_data = audio_to_notes(audio_bytes, audio.filename)
-    result = compare_notes(score_data["notes"], audio_data["notes"])
+    normalized_score, score_type = await run_in_threadpool(normalize_score, pdf_bytes, score.filename)
+    if os.getenv("NOTA_OMR_V3_ENABLED", "false").lower() == "true":
+        from score_omr_v3 import pdf_to_notes as pdf_to_notes_v3
+        score_data = await pdf_to_notes_v3(normalized_score, exercise)
+    else:
+        score_data = await pdf_to_notes(normalized_score, exercise)
+    audio_data = await run_in_threadpool(audio_to_notes, audio_bytes, audio.filename)
+    result = await run_in_threadpool(compare_notes, score_data["notes"], audio_data["notes"])
     report = professional_report(result, score_data, audio_data)
     guidance = instrument_guidance(profile)
     report["instrument_guidance"] = guidance
     timed=None
     grade={"status":"insufficient_evidence","technical_score_100":None,"professional_score_100":None}
-    if bpm is not None and not 20 <= bpm <= 300:
-        raise HTTPException(422,"BPM must be 20..300")
-    if beats_per_measure is not None and not 1 <= beats_per_measure <= 12:
-        raise HTTPException(422,"beats_per_measure must be 1..12")
     if bpm and score_data.get("events") and audio_data.get("events"):
         try:
             reference=[Event(midi=e["midi"],start=e["onset_beats"]*60/bpm,
                              duration=e["duration_beats"]*60/bpm) for e in score_data["events"]]
             performed=[Event(midi=e["midi"],start=e["start"],duration=e["duration"])
                        for e in audio_data["events"]]
-            timed=analyze(reference,performed,60/bpm,beats_per_measure)
+            timed=await run_in_threadpool(analyze,reference,performed,60/bpm,beats_per_measure)
             grade=technical_score(timed,score_confidence=score_data["confidence"],
                                   audio_events=audio_data["events"])
-        except ValueError:
-            pass
+        except ValueError as error:
+            report["measurement_limitations"].append("Timed analysis unavailable: " + str(error))
     if timed is not None:
         report["sections"]["baholash_mezonlari"]["ritm"] = timed["rhythm"]
         report["sections"]["baholash_mezonlari"]["temp"] = timed["tempo"]

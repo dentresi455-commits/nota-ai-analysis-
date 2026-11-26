@@ -1,0 +1,244 @@
+name: NOTA AI staging OMR stability (Gemini retries and provider fallback)
+
+on:
+  push:
+    branches:
+      - omr-v3-test-20261121
+    paths:
+      - .github/workflows/nota-ai-omr-stability.yml
+
+permissions:
+  contents: write
+
+jobs:
+  stabilize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout staging branch
+        uses: actions/checkout@v4
+        with:
+          ref: omr-v3-test-20261121
+          persist-credentials: true
+
+      - name: Install dependencies for safe local tests
+        run: |
+          python3 -m pip install -q -r requirements.txt pytest pytest-asyncio
+
+      - name: Create standalone backwards-compatible patch script
+        run: |
+          cat > /tmp/nota_ai_omr_stability_patch.py <<'NOTA_PATCH_EOF'
+          #!/usr/bin/env python3
+          """Idempotent, conservative NOTA AI OMR v3 staging stability patch.
+          
+          - Limit burst concurrency to 2 by default (1..3 configurable).
+          - Add opt-in image-capable OpenRouter/Groq fallback after retryable Gemini failures.
+          - Fail closed: fallback data is unverified, no fictitious 100-point grade.
+          """
+          from pathlib import Path
+          import re
+          import sys
+          
+          path = Path(sys.argv[1] if len(sys.argv) > 1 else 'score_omr_v3.py')
+          s = path.read_text(encoding='utf-8')
+          if 'NOTA_OMR_FALLBACK_V1' in s:
+              print('ALREADY_PATCHED')
+              sys.exit(0)
+          
+          old = 'OMR_CONCURRENT_SYSTEMS = 3'
+          new = 'OMR_CONCURRENT_SYSTEMS = max(1, min(3, int(os.getenv("NOTA_OMR_CONCURRENT_SYSTEMS", "2"))))'
+          assert s.count(old) == 1, 'Expected OMR concurrency line missing/changed'
+          s = s.replace(old, new, 1)
+          
+          helper = '''# NOTA_OMR_FALLBACK_V1: opt-in third-party vision fallback for repeated Gemini 5xx.
+          # Third-party requests MUST be explicitly enabled in Render staging. Provider
+          # keys and model IDs must be configured there; no credentials are embedded here.
+          async def _optional_vision_fallback(img: Image.Image, instruction: str,
+                                              page_number: int, client: httpx.AsyncClient,
+                                              failed_reason: str) -> dict | None:
+              if os.getenv("NOTA_ENABLE_VISION_FALLBACK", "false").lower() != "true":
+                  return None
+              data_url = "data:image/png;base64," + _to_png_base64(img)
+              content = [
+                  {"type": "text", "text": instruction},
+                  {"type": "image_url", "image_url": {"url": data_url}},
+              ]
+              providers = [
+                  ("openrouter", "OPENROUTER_API_KEY", "NOTA_OPENROUTER_VISION_MODEL",
+                   "https://openrouter.ai/api/v1/chat/completions"),
+                  ("groq", "GROQ_API_KEY", "NOTA_GROQ_VISION_MODEL",
+                   "https://api.groq.com/openai/v1/chat/completions"),
+              ]
+              for name, key_env, model_env, url in providers:
+                  api_key, model = os.getenv(key_env, "").strip(), os.getenv(model_env, "").strip()
+                  # Never guess a provider/model.  Skip unavailable or improperly configured.
+                  if not api_key or not model or len(model) > 150 or not re.fullmatch(r"[a-zA-Z0-9_.:/-]+", model):
+                      continue
+                  try:
+                      response = await client.post(
+                          url,
+                          headers={"Authorization": "Bearer " + api_key,
+                                   "Content-Type": "application/json"},
+                          json={"model": model,
+                                "messages": [{"role": "user", "content": content}],
+                                "temperature": 0, "max_tokens": 4096},
+                          timeout=15,
+                      )
+                      # Fail closed for auth, unsupported model, quota or provider outage.
+                      if response.status_code != 200:
+                          continue
+                      payload = response.json()
+                      message = payload["choices"][0]["message"]["content"]
+                      if isinstance(message, list):
+                          message = "".join(p.get("text", "") for p in message if isinstance(p, dict))
+                      if not isinstance(message, str):
+                          continue
+                      clean = message.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+                      result = _validated_page(json.loads(clean), page_number)
+                      result["confidence"] = "low"
+                      result["needs_review"] = True
+                      result["warnings"] = list(dict.fromkeys([
+                          *result["warnings"], "vision_fallback_used_" + name,
+                          "gemini_retryable_failure", "fallback_requires_teacher_review",
+                      ]))
+                      return result
+                  except (httpx.HTTPError, ValueError, KeyError, TypeError, IndexError):
+                      continue
+              return None
+          
+          
+          '''
+          anchor = 'async def _gemini_page('
+          assert s.count(anchor) == 1, 'OMR Gemini handler anchor changed'
+          s = s.replace(anchor, helper + anchor, 1)
+          
+          # Only trigger the third-party fallback after actual retryable provider 5xx or network timeouts.
+          anchor = '    last_reason = "invalid_response"\n    first_valid = None\n'
+          assert s.count(anchor) == 1, 'Gemini last_reason anchor changed'
+          s = s.replace(anchor, '    last_reason = "invalid_response"\n    retryable_upstream_failure = False\n    first_valid = None\n', 1)
+          
+          anchor = '                last_reason = f"gemini_upstream_{response.status_code}"\n'
+          assert s.count(anchor) == 1, 'Gemini 5xx anchor changed'
+          s = s.replace(anchor, anchor + '                retryable_upstream_failure = True\n', 1)
+          
+          anchor = '            last_reason = "gemini_timeout_or_network"\n'
+          assert s.count(anchor) == 1, 'Network timeout anchor changed'
+          s = s.replace(anchor, anchor + '            retryable_upstream_failure = True\n', 1)
+          
+          anchor = '    raise HTTPException(status_code=502, detail=f"gemini_omr_failed_{last_reason}")\n'
+          assert s.count(anchor) == 1, 'Gemini final raise anchor changed'
+          s = s.replace(anchor,
+          '''    if retryable_upstream_failure:
+                  backup_result = await _optional_vision_fallback(
+                      img, instruction, page_number, client, last_reason)
+                  if backup_result is not None:
+                      return backup_result
+              raise HTTPException(status_code=502, detail=f"gemini_omr_failed_{last_reason}")
+          ''', 1)
+          
+          path.write_text(s, encoding='utf-8')
+          compile(s, str(path), 'exec')
+          print('PATCH_OK:', path, 'bytes=', path.stat().st_size)
+          NOTA_PATCH_EOF
+          python3 /tmp/nota_ai_omr_stability_patch.py score_omr_v3.py
+
+      - name: Run deterministic fallback and auth-safety tests
+        run: |
+          cat > /tmp/test_nota_omr_stability.py <<'NOTA_TEST_EOF'
+          import asyncio, importlib.util, os, json
+          from unittest.mock import patch
+          from PIL import Image
+          import pytest
+          import score_omr_v3 as mod
+          class FakeResponse:
+           status_code=200
+           def json(self):
+            return {'choices':[{'message':{'content':json.dumps({'notes':[60,62],'events':[],'confidence':'medium','needs_review':True,'warnings':[]})}}]}
+          class FakeClient:
+           def __init__(self):self.calls=[]
+           async def post(self,url,**kwargs):self.calls.append({'url':url,'headers':kwargs.get('headers',{}),'json':kwargs.get('json',{})});return FakeResponse()
+          @pytest.mark.asyncio
+          async def test_backup_openrouter_optin():
+           client=FakeClient();img=Image.new('RGB',(20,20),'white')
+           env={'NOTA_ENABLE_VISION_FALLBACK':'true','OPENROUTER_API_KEY':'test-not-a-real-key','NOTA_OPENROUTER_VISION_MODEL':'test/vision-1'}
+           with patch.dict(os.environ,env,clear=False):
+            r=await mod._optional_vision_fallback(img,'Read one staff',1,client,'gemini_upstream_503')
+           assert r['notes']==[60,62]
+           assert r['needs_review'] and r['confidence']=='low'
+           assert 'vision_fallback_used_openrouter' in r['warnings']
+           assert client.calls[0]['url']=='https://openrouter.ai/api/v1/chat/completions'
+           assert client.calls[0]['json']['messages'][0]['content'][1]['image_url']['url'].startswith('data:image/png;base64,')
+          @pytest.mark.asyncio
+          async def test_disabled_no_request():
+           client=FakeClient()
+           with patch.dict(os.environ,{'NOTA_ENABLE_VISION_FALLBACK':'false'},clear=False):
+            r=await mod._optional_vision_fallback(Image.new('RGB',(10,10)), 'a',1,client,'503')
+           assert r is None and client.calls==[]
+          @pytest.mark.asyncio
+          async def test_missing_keys_no_request():
+           client=FakeClient()
+           with patch.dict(os.environ,{'NOTA_ENABLE_VISION_FALLBACK':'true','OPENROUTER_API_KEY':'','GROQ_API_KEY':''},clear=False):
+            r=await mod._optional_vision_fallback(Image.new('RGB',(10,10)), 'a',1,client,'503')
+           assert r is None and client.calls==[]
+          @pytest.mark.asyncio
+          async def test_invalid_response_no_fake_score():
+           class BadClient(FakeClient):
+            async def post(self,url,**kwargs):
+             class R:status_code=503
+             return R()
+           with patch.dict(os.environ,{'NOTA_ENABLE_VISION_FALLBACK':'true','OPENROUTER_API_KEY':'x','NOTA_OPENROUTER_VISION_MODEL':'test/vision','GROQ_API_KEY':''},clear=False):
+            r=await mod._optional_vision_fallback(Image.new('RGB',(10,10)), 'a',1,BadClient(),'503')
+           assert r is None
+          @pytest.mark.asyncio
+          async def test_gemini_503_retries_then_openrouter_fallback():
+           from unittest.mock import AsyncMock
+           from fastapi import HTTPException
+           class MultiClient(FakeClient):
+            async def post(self, url, **kwargs):
+             self.calls.append({'url':url, 'headers': kwargs.get('headers')})
+             if 'generativelanguage.googleapis.com' in url:
+              class Error:
+               status_code=503
+              return Error()
+             return FakeResponse()
+           client=MultiClient()
+           env={'GEMINI_API_KEY':'test-key','GEMINI_MODEL':'gemini-3.5-flash-lite',
+                'GEMINI_BACKUP_MODEL':'gemini-3.1-flash-lite',
+                'NOTA_ENABLE_VISION_FALLBACK':'true',
+                'OPENROUTER_API_KEY':'test-key','NOTA_OPENROUTER_VISION_MODEL':'test/vision-1'}
+           with patch.dict(os.environ,env,clear=False), patch.object(mod.asyncio,'sleep',new=AsyncMock()):
+            r=await mod._gemini_page(Image.new('RGB',(20,20),'white'),page_number=1,exercise=None,client=client)
+           assert r['notes']==[60,62] and r['needs_review'] is True and r['confidence']=='low'
+           assert len(client.calls)==3
+           assert 'vision_fallback_used_openrouter' in r['warnings']
+          
+          @pytest.mark.asyncio
+          async def test_gemini_503_without_optin_does_not_fabricate():
+           from unittest.mock import AsyncMock
+           from fastapi import HTTPException
+           class MultiClient(FakeClient):
+            async def post(self, url,**kwargs):
+             class Error:
+              status_code=503
+             return Error()
+           env={'GEMINI_API_KEY':'test-key','NOTA_ENABLE_VISION_FALLBACK':'false'}
+           with patch.dict(os.environ,env,clear=False),patch.object(mod.asyncio,'sleep',new=AsyncMock()):
+            with pytest.raises(HTTPException) as e:
+             await mod._gemini_page(Image.new('RGB',(20,20),'white'),page_number=1,exercise=None,client=MultiClient())
+           assert e.value.status_code==502
+           assert '503' in e.value.detail
+          NOTA_TEST_EOF
+          python3 -m py_compile score_omr_v3.py
+          PYTHONPATH=. python3 -m pytest -q /tmp/test_nota_omr_stability.py
+
+      - name: Commit only the tested OMR changes to staging
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add score_omr_v3.py
+          if ! git diff --cached --quiet; then
+            git commit -m 'Stabilize OMR Gemini calls and add opt-in vision fallback'
+            git push origin HEAD:omr-v3-test-20261121
+          else
+            echo 'OMR stability patch is already applied'
+          fi

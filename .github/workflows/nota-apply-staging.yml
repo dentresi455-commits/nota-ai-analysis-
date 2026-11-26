@@ -1,0 +1,48 @@
+name: NOTA AI - activate staging analysis
+
+on:
+  push:
+    branches:
+      - omr-v3-test-20261121
+    paths:
+      - .github/workflows/nota-apply-staging.yml
+
+permissions:
+  contents: write
+
+jobs:
+  activate:
+    name: Apply and verify backend patches
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout test branch
+        uses: actions/checkout@v4
+        with:
+          ref: omr-v3-test-20261121
+          persist-credentials: true
+
+      - name: Apply existing patch script
+        run: |
+          python3 apply_backend_patch.py .
+          python3 -m py_compile app.py advanced_analysis.py long_audio.py long_alignment.py
+          python3 - <<'PY'
+          from pathlib import Path
+          app = Path('app.py').read_text()
+          advanced = Path('advanced_analysis.py').read_text()
+          assert 'from long_audio import audio_to_notes' in app
+          assert 'from long_alignment import compare_complete as compare_notes' in app
+          assert 'return events[:500]' not in advanced
+          print('NOTA AI staging integration checks passed')
+          PY
+
+      - name: Commit changes to test branch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app.py advanced_analysis.py
+          if ! git diff --cached --quiet; then
+            git commit -m 'Activate long audio and complete note alignment on staging'
+            git push origin HEAD:omr-v3-test-20261121
+          else
+            echo 'Already integrated, no changes needed.'
+          fi

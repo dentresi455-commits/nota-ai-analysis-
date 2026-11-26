@@ -52,7 +52,7 @@ def extract_events(samples, rate, hop_seconds=.025):
             start_idx=i if n is not None else None
             last=n
     emit(len(smooth))
-    return events[:500]
+    return events
 
 
 def technical_score(alignment, *, score_confidence, audio_events):

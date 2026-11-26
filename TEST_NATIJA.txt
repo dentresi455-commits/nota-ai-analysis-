@@ -1,0 +1,11 @@
+NOTA AI kompleks staging patch
+Date: 2026-11-25
+Command: PYTHONPATH=backend pytest -q tests
+Result: 28 passed, 0 failed.
+Coverage: 900-second PCM WAV, >500 retained events, stable chunk transitions,
+full-sequence pitch comparison, memory budget failure, six Dilnoz score staves,
+provider retry with mocked 503 and model fallback, rate-limit protection,
+source patch idempotence and Vercel source mismatch refusal.
+These are isolated unit/integration tests, not proof of end-to-end user login,
+credit billing, production upload flow, or genuine Gemini transcription.
+No production deployment was made.
