@@ -30,7 +30,7 @@ try:
 except ImportError:
     pass
 
-app = FastAPI(title="NOTA AI Analysis", version="0.9.7")
+app = FastAPI(title="NOTA AI Analysis", version="0.9.8")
 # Reject concurrent heavy jobs rather than accumulating uploads in RAM.
 _ANALYSIS_LOCK = asyncio.Lock()
 MAX_PDF = (32 if os.getenv("NOTA_OMR_V3_ENABLED", "false").lower() == "true" else 8) * 1024 * 1024
@@ -459,17 +459,17 @@ def _align_excerpt(ref, played):
         trace.append(moves);prev=row
     best = min(prev[1:]); endpoints = [j for j in range(1,m+1) if prev[j]==best]
     def backtrack(j):
-        finish=j; i=n; pairs=[]; edits=0
+        finish=j; i=n; pairs=[]; edits=0; operations=[]
         while i:
             move=trace[i][j]
             if j and move==0:
                 if short[i-1]==long[j-1]:pairs.append((i-1,j-1))
-                else:edits+=1
+                else:edits+=1;operations.append(("wrong_pitch",i-1,j-1))
                 i-=1;j-=1
-            elif move==1 or not j:i-=1;edits+=1
-            else:j-=1;edits+=1
-        return j,finish,list(reversed(pairs)),edits
-    begin,finish,pairs,edits=backtrack(endpoints[0])
+            elif move==1 or not j:operations.append(("extra_note",i-1,None));i-=1;edits+=1
+            else:operations.append(("missing_note",None,j-1));j-=1;edits+=1
+        return j,finish,list(reversed(pairs)),edits,list(reversed(operations))
+    begin,finish,pairs,edits,operations=backtrack(endpoints[0])
     span=finish-begin; matches=len(pairs)
     # Require enough distinctive exact evidence; a coincidental or all-wrong sequence is not a grade.
     if span < 5 or matches < 5 or matches/max(n,span)<.40:return None
@@ -478,8 +478,8 @@ def _align_excerpt(ref, played):
     # Repeated phrases may share the same grade, but their location is ambiguous.
     ambiguous=any(j>=finish+max(3,n//2) for j in endpoints[1:])
     if swapped:
-        return (0,n,begin,finish,[(i,j) for i,j in pairs],edits,ambiguous)
-    return (begin,finish,0,n,[(j,i) for i,j in pairs],edits,ambiguous)
+        return (0,n,begin,finish,[(i,j) for i,j in pairs],edits,ambiguous,[("missing_note" if k=="extra_note" else "extra_note" if k=="missing_note" else k,i,j) for k,i,j in operations])
+    return (begin,finish,0,n,[(j,i) for i,j in pairs],edits,ambiguous,[(k,j,i) for k,i,j in operations])
 
 
 def estimate_partial(score, audio, bpm=None):
@@ -491,11 +491,11 @@ def estimate_partial(score, audio, bpm=None):
     if any(type(n) is not int or not 21<=n<=108 for n in ref+played):return None
     aligned=_align_excerpt(ref,played)
     if aligned is None:return None
-    rs,re,ps,pe,pairs,edits,ambiguous=aligned
+    rs,re,ps,pe,pairs,edits,ambiguous,operations=aligned
     x=ref[rs:re]; y=played[ps:pe]; matches=len(pairs)
     pitch=round(max(0,100*(1-edits/max(len(x),len(y)))),1)
     metrics={'notation_accuracy':pitch}
-    intervals=[]
+    intervals=[]; interval_positions=[]
     se=s.get('events') or []; ae=a.get('events') or []
     def valid_events(events, notes, start, duration, audio=False):
         if len(events)<len(notes):return False
@@ -511,18 +511,65 @@ def estimate_partial(score, audio, bpm=None):
             if i2!=i+1 or j2!=j+1:continue
             if any(isinstance(e.get('confidence'),bool) or not isinstance(e.get('confidence'),(int,float)) or not math.isfinite(e['confidence']) or not .65<=e['confidence']<=1 for e in ae[j:j+2]):continue
             rb=se[i2]['onset_beats']-se[i]['onset_beats']; ps_delta=ae[j2]['start']-ae[j]['start']
-            if rb>0 and ps_delta>.02:intervals.append((rb,ps_delta))
+            if rb>0 and ps_delta>.02:intervals.append((rb,ps_delta));interval_positions.append((i2,j2))
         if len(intervals)>=4:
             scale=median(p/r for r,p in intervals)
             metrics['rhythm']=round(100*(1-mean(min(1,abs(p/(r*scale)-1)) for r,p in intervals)),1)
             if isinstance(bpm,(int,float)) and not isinstance(bpm,bool) and math.isfinite(bpm) and 20<=bpm<=300:
                 metrics['tempo']=round(max(0,100-200*abs((60/scale)/bpm-1)),1)
+    errors=[]
+    labels={'wrong_pitch':'Noto‘g‘ri tovush','missing_note':'Tushib qolgan nota','extra_note':'Ortiqcha tovush'}
+    def note_name(m):return ('Do','Do♯','Re','Re♯','Mi','Fa','Fa♯','Sol','Sol♯','La','La♯','Si')[m%12]+str(m//12-1)
+    for kind,i,j in operations:
+        e={'type':kind,'category':labels[kind]}
+        if i is not None:
+            e.update(expected_midi=ref[i],reference_position=i+1,reference_note=i+1)
+        if j is not None:
+            e.update(performed_midi=played[j],performed_position=j+1,performed_note=j+1)
+            if len(ae)>j and isinstance(ae[j],dict) and ae[j].get('midi')==played[j]:
+                t=ae[j].get('start')
+                if type(t) in (int,float) and math.isfinite(t) and t>=0:e['audio_time_seconds']=round(t,2)
+        if kind=='wrong_pitch':
+            delta=played[j]-ref[i];e['semitone_difference']=delta
+            e['explanation']=f"{note_name(ref[i])} o‘rniga {note_name(played[j])}: {abs(delta)} yarim ton {'baland' if delta>0 else 'past'}."
+            e['practice']=f"{note_name(ref[i])} tovushini qo‘shni notalar bilan sekin mashq qiling."
+        elif kind=='missing_note':
+            e['explanation']=f"{note_name(ref[i])} ijro ketma-ketligida topilmadi."
+            e['practice']=f"{note_name(ref[i])} va yonidagi notalarning o‘tishini takrorlang."
+        else:
+            e['explanation']=f"{note_name(played[j])} moslashtirilgan notalar orasida qo‘shimcha tovush sifatida ajraldi."
+            e['practice']='Shu o‘tishni sekin chalib, tovushlar ketma-ketligini tekshiring.'
+        if ambiguous:
+            e.pop('reference_note',None);e.pop('reference_position',None)
+        errors.append(e)
+    if 'rhythm' in metrics:
+        for (rb,p),(i,j) in zip(intervals,interval_positions):
+            deviation=p/(rb*scale)-1
+            if abs(deviation)>.25:
+                errors.append({'type':'rhythm_deviation','category':'Ritmik og‘ish','reference_note':i+1,'performed_note':j+1,'audio_time_seconds':round(ae[j]['start'],2),'explanation':f"Nota oralig‘i parchaning asosiy tempiga nisbatan {abs(deviation)*100:.0f}% {'uzunroq' if deviation>0 else 'qisqaroq'}.",'practice':'Nota oralig‘ini metronom bilan mashq qiling.'})
+    intonation=[]
+    for i,j in pairs:
+        if j>=len(ae) or not isinstance(ae[j],dict):continue
+        ev=ae[j]; cents=ev.get('pitch_deviation_cents'); frames=ev.get('pitch_measurement_frames'); conf=ev.get('confidence')
+        if ev.get('midi')!=played[j] or type(cents) not in (int,float) or not math.isfinite(cents) or abs(cents)>50 or type(frames) is not int or frames<3 or type(conf) not in (int,float) or not .65<=conf<=1:continue
+        intonation.append((i,j,cents))
+    # A4=440 equal-tempered reference, not a claim about expressive tuning or instrument setup.
+    if len(intonation)>=5 and len(intonation)>=math.ceil(matches*.5):
+        metrics['intonation']=round(100*mean(max(0,1-abs(c)/50) for _,_,c in intonation),1)
+        for i,j,c in intonation:
+            if abs(c)>25:
+                e={'type':'intonation_deviation','category':'Intonatsiya og‘ishi','performed_note':j+1,'explanation':f"{note_name(played[j])} tovushi A4=440 Hz etaloniga nisbatan {abs(c):.1f} sent {'baland' if c>0 else 'past'}.",'practice':'Cholg‘u sozini tekshirib, shu tovushni tyuner bilan mashq qiling.'}
+                if not ambiguous:e['reference_note']=i+1
+                if type(ae[j].get('start')) in (int,float) and math.isfinite(ae[j]['start']):e['audio_time_seconds']=round(ae[j]['start'],2)
+                errors.append(e)
+    counts={k:sum(e['type']==k for e in errors) for k in labels}
     weight=sum(_PARTIAL_WEIGHTS[k] for k in metrics)
     grade=round(sum(_PARTIAL_WEIGHTS[k]*v for k,v in metrics.items())/weight,1)
     return {'status':'estimated','scope':'observed_excerpt_only','partial_score_100':grade,'measured_weight_percent':weight,
             'criteria':{k:{'score_percent':metrics.get(k),'weight':w,'status':'estimated' if k in metrics else 'not_measured'} for k,w in _PARTIAL_WEIGHTS.items()},
             'reference_start':rs+1,'performed_start':ps+1,'reference_count':len(x),'performed_count':len(y),
             'compared_note_count':min(len(x),len(y)),'matched_anchor_notes':matches,'compared_intervals':len(intervals),
+            'edit_count':edits,'error_counts':counts,'errors':errors,'intonation_note_count':len(intonation) if 'intonation' in metrics else 0,'observed_tempo_bpm':round(60/scale,1) if 'rhythm' in metrics else None,
             'professional_score_100':None,'technical_score_100':None,'alignment_ambiguous':ambiguous,'warning':'Taxminiy parcha bahosi, yakuniy professional baho emas.'+(' Bir nechta mos parcha bor; joylashuv noaniq.' if ambiguous else '')}
 
 
@@ -533,36 +580,37 @@ def _partial_report(score_data, audio_data, comparison, report, profile, score_t
     if sn:covered.append(f"Nota faylidan {sn} ta tovush o‘qildi ({s.get('staff_system_count', 0)} ta nota satri).")
     if an:
         secs=a.get("analyzed_seconds",a.get("duration_seconds"))
-        covered.append(f"Ijrodan {an} ta taxminiy tovush aniqlandi"+(f"; {secs:.1f} soniya o‘lchandi." if isinstance(secs,(int,float)) else "."))
-    summary="Qisman tahlil. "+" ".join(covered)
+        covered.append(f"Ijrodan {an} ta tovush ajratildi"+(f"; {secs:.1f} soniya o‘lchandi." if isinstance(secs,(int,float)) else "."))
+    summary="Tahlil qilingan parcha. "+" ".join(covered)
     metrics={k:None for k in ("nota_ketma_ketligi","ritm","temp","intonatsiya","artikulyatsiya","ifodalilik")}
-    issues=[]; plans=[]; teacher="Mavjud natijalar dastlabki. O‘qilmagan qism bo‘yicha ijro xatosi yoki yakuniy ball belgilanmaydi."
-    if comparison is not None:
-        try:
-            existing=report or professional_report(comparison,s,a)
-            sec=existing["sections"]
-            metrics=sec["baholash_mezonlari"]
-            issues=sec["aniqlangan_xatolar"]
-            plans=sec["individual_mashgulot_rejasi"]
-            summary+=" "+sec["umumiy_xulosa"]
-            teacher=sec["pedagog_xulosasi"]+" Yakunlanmagan mezonlar baholanmadi."
-        except Exception:
-            comparison=None
-    if comparison is None:
-        summary+=" Nota va ijroning to‘liq mosligi hisoblanmadi; mavjud tovushlar alohida ko‘rsatildi."
-        if sn:plans.append({"minutes":5,"task":"O‘qilgan nota qismini asl partitura bilan tekshirish"})
-        if an:plans.append({"minutes":5,"task":"O‘lchangan ijro qismini sekin tempda qayta tinglash va pedagog bilan tekshirish"})
-        plans.append({"minutes":5,"task":"Qolgan qismni alohida, tiniq yozuv bilan tekshirish"})
+    issues=[]; plans=[]; teacher="Nota va ijroni solishtirish uchun ravshanroq parcha kerak."
+    # Do not reuse whole-score errors for partial results: unheard tails are not mistakes.
+    comparison=None
+    if sn:plans.append({"minutes":5,"task":"O‘qilgan nota qismini asl partitura bilan tekshirish"})
+    if an:plans.append({"minutes":5,"task":"Yozilgan ijro parchasini sekin tempda qayta tinglash"})
     if observed is not None:
         metrics_map={"notation_accuracy":"nota_ketma_ketligi","intonation":"intonatsiya","rhythm":"ritm","tempo":"temp","articulation":"artikulyatsiya","expression":"ifodalilik"}
-        for k, item in observed["criteria"].items():
+        for k,item in observed["criteria"].items():
             metrics[metrics_map[k]]={"value_percent":item["score_percent"],"status":item["status"],"scope":"observed_excerpt_only"}
-        summary=f"Qisman tahlil. {' '.join(covered)} Moslashtirilgan parchada taxminiy baho {observed['partial_score_100']}/100. Mezonlar vaznining {observed['measured_weight_percent']} foizi o‘lchandi; bu asar qamrovi yoki yakuniy baho emas."
-        issues=[]
-        teacher="Faqat moslashtirilgan parcha bo‘yicha taxminiy baho. O‘qilmagan qismga va o‘lchanmagan mezonlarga baho berilmadi."+ (" Bir nechta bir xil mos parcha mavjud; joylashuv noaniq." if observed.get("alignment_ambiguous") else "")
-        plans=[{"minutes":5,"task":"Moslashtirilgan parchani asl nota bilan tekshirish"},{"minutes":5,"task":"Parchani sekin tempda takrorlash"},{"minutes":5,"task":"Qolgan qismni alohida tekshirish"}]
-        if observed is not None:
-            comparison={"reference_count":observed["reference_count"],"performed_count":observed["performed_count"],"compared_note_count":observed["compared_note_count"],"note_similarity_percent":observed["criteria"]["notation_accuracy"]["score_percent"],"comparison_status":"tentative","assessment_scope":"observed_excerpt_only","reference_start":observed["reference_start"],"performed_start":observed["performed_start"],"rhythm_scored":observed["criteria"]["rhythm"]["score_percent"] is not None,"detailed_feedback":{"correct_notes":observed["matched_anchor_notes"],"errors":[],"error_counts":{}}}
+        issues=observed['errors']; counts=observed['error_counts']; exact=observed['matched_anchor_notes']; edit=observed['edit_count']
+        summary=f"Tahlil qilingan parcha: {observed['partial_score_100']}/100 ball. {observed['reference_count']} ta nota va {observed['performed_count']} ta ijro tovushi solishtirildi; {exact} ta tovush mos keldi."
+        teacher=f"Nota ketma-ketligida {observed['criteria']['notation_accuracy']['score_percent']}% moslik qayd etildi. "
+        if edit:
+            teacher+=f"Moslashtirishda {counts['wrong_pitch']} ta balandlik farqi, {counts['missing_note']} ta topilmagan nota va {counts['extra_note']} ta qo‘shimcha tovush qayd etildi. "
+        else:teacher+="Moslashtirilgan tovushlar ketma-ketligida farq topilmadi. "
+        if observed.get('alignment_ambiguous'):teacher+="Asarda o‘xshash takroriy parchalar bor; nota joylashuvini asl partituradan tekshiring. "
+        if s.get('confidence')!='high':teacher+="Nota tanish natijasini asl partitura bilan solishtirish tavsiya etiladi. "
+        if observed.get('observed_tempo_bpm') is not None:teacher+=f"Mos nota oraliqlaridagi ijro sur’ati {observed['observed_tempo_bpm']} BPM. "
+        if observed['criteria']['rhythm']['score_percent'] is not None:teacher+=f"Ritmik moslik {observed['criteria']['rhythm']['score_percent']}%. "
+        if observed['criteria']['intonation']['score_percent'] is not None:teacher+=f"A4=440 Hz etaloni bo‘yicha {observed['intonation_note_count']} ta tovushda intonatsiya mosligi {observed['criteria']['intonation']['score_percent']}%. "
+        plans=[]
+        if any(e['type']=='intonation_deviation' for e in issues):plans.append({'minutes':5,'task':'Cholg‘u sozini tekshirish va belgilangan tovushlarni tyuner bilan mashq qilish'})
+        for category,task in [('wrong_pitch','Balandligi farqlangan notalarni alohida chalish'),('missing_note','Topilmagan notalar va qo‘shni o‘tishlarni takrorlash'),('extra_note','Qo‘shimcha tovushlar ajralgan o‘tishlarni nazorat qilish')]:
+            if counts[category]:plans.append({'minutes':5,'task':task})
+        if any(e['type']=='rhythm_deviation' for e in issues):plans.append({'minutes':5,'task':'Ritmik og‘ish qayd etilgan oraliqlarni metronom bilan takrorlash'})
+        plans.append({'minutes':5,'task':'Moslashtirilgan parchani sekin tempda qayta ijro etish'})
+        plans.append({'minutes':3,'task':'Shu parchani qayta yozib natijalarni solishtirish'})
+        comparison={"reference_count":observed["reference_count"],"performed_count":observed["performed_count"],"compared_note_count":observed["compared_note_count"],"note_similarity_percent":observed["criteria"]["notation_accuracy"]["score_percent"],"comparison_status":"tentative","assessment_scope":"observed_excerpt_only","reference_start":observed["reference_start"],"performed_start":observed["performed_start"],"rhythm_scored":observed["criteria"]["rhythm"]["score_percent"] is not None,"detailed_feedback":{"correct_notes":exact,"errors":issues,"error_counts":counts}}
     guidance=instrument_guidance(profile)
     return {"analysis_status":"partial","completed_stages":[k for k,v in (("score",sn),("audio",an),("comparison",comparison is not None)) if v],
         "stopped_stage":stage,"stop_reason":reason,"score":s or None,"score_input_type":score_type,"audio":a or None,
