@@ -30,7 +30,7 @@ try:
 except ImportError:
     pass
 
-app = FastAPI(title="NOTA AI Analysis", version="0.9.3")
+app = FastAPI(title="NOTA AI Analysis", version="0.9.7")
 # Reject concurrent heavy jobs rather than accumulating uploads in RAM.
 _ANALYSIS_LOCK = asyncio.Lock()
 MAX_PDF = (32 if os.getenv("NOTA_OMR_V3_ENABLED", "false").lower() == "true" else 8) * 1024 * 1024
@@ -434,28 +434,66 @@ from statistics import median, mean
 
 _PARTIAL_WEIGHTS = {'notation_accuracy':25,'intonation':20,'rhythm':20,'tempo':15,'articulation':10,'expression':10}
 
+def _align_excerpt(ref, played):
+    """Semi-global edit alignment: all of the shorter observed sequence, free outer tails of the longer.
+    Exact MIDI anchors only; no automatic key or octave shift. Bounded work for checkpoints.
+    """
+    swapped = len(played) > len(ref)
+    short, long = (ref, played) if swapped else (played, ref)
+    n, m = len(short), len(long)
+    if n < 5 or m < n:return None
+    # Edit cost is primary; exact matches break ties. Store traceback in compact rows.
+    unit = n + 1
+    prev = [0] * (m+1)
+    trace = [bytearray(m+1)]
+    for i, note in enumerate(short, 1):
+        row = [i*unit] + [0]*m
+        moves = bytearray(m+1); moves[0] = 1
+        for j, other in enumerate(long, 1):
+            diag = prev[j-1] + ( -1 if note == other else unit )
+            up = prev[j] + unit
+            left = row[j-1] + unit
+            if diag <= up and diag <= left:row[j]=diag;moves[j]=0
+            elif up <= left:row[j]=up;moves[j]=1
+            else:row[j]=left;moves[j]=2
+        trace.append(moves);prev=row
+    best = min(prev[1:]); endpoints = [j for j in range(1,m+1) if prev[j]==best]
+    def backtrack(j):
+        finish=j; i=n; pairs=[]; edits=0
+        while i:
+            move=trace[i][j]
+            if j and move==0:
+                if short[i-1]==long[j-1]:pairs.append((i-1,j-1))
+                else:edits+=1
+                i-=1;j-=1
+            elif move==1 or not j:i-=1;edits+=1
+            else:j-=1;edits+=1
+        return j,finish,list(reversed(pairs)),edits
+    begin,finish,pairs,edits=backtrack(endpoints[0])
+    span=finish-begin; matches=len(pairs)
+    # Require enough distinctive exact evidence; a coincidental or all-wrong sequence is not a grade.
+    if span < 5 or matches < 5 or matches/max(n,span)<.40:return None
+    if len({short[i] for i,j in pairs})<3:return None
+    if span > max(n+8, int(n*1.6)) or span < max(5,int(n*.60)):return None
+    # Repeated phrases may share the same grade, but their location is ambiguous.
+    ambiguous=any(j>=finish+max(3,n//2) for j in endpoints[1:])
+    if swapped:
+        return (0,n,begin,finish,[(i,j) for i,j in pairs],edits,ambiguous)
+    return (begin,finish,0,n,[(j,i) for i,j in pairs],edits,ambiguous)
+
+
 def estimate_partial(score, audio, bpm=None):
     s=score or {}; a=audio or {}
-    ref=list(s.get('notes') or [])[:256]; played=list(a.get('notes') or [])[:256]
-    if min(len(ref),len(played))<5:return None
+    # Search farther into the longer stream while limiting the scored shorter excerpt.
+    ref=list(s.get('notes') or [])[:1024]; played=list(a.get('notes') or [])[:1024]
+    if len(ref)<=len(played):ref=ref[:256]
+    else:played=played[:256]
     if any(type(n) is not int or not 21<=n<=108 for n in ref+played):return None
-    blocks=[b for b in SequenceMatcher(None,ref,played,autojunk=False).get_matching_blocks() if b.size>=3 and len(set(ref[b.a:b.a+b.size]))>=2]
-    if not blocks:return None
-    first=last=blocks[0]; chosen=[first]
-    if first.a>4 or first.b>4:return None
-    for b in blocks[1:]:
-        if b.a-last.a-last.size>8 or b.b-last.b-last.size>8:break
-        chosen.append(b);last=b
-    matches=sum(b.size for b in chosen)
-    x=ref[first.a:last.a+last.size]; y=played[first.b:last.b+last.size]
-    if matches<5 or matches/max(len(x),len(y))<.6:return None
-    # Edit distance over the bounded excerpt, not the whole unread score.
-    prev=list(range(len(y)+1))
-    for i,n in enumerate(x,1):
-        curr=[i]
-        for j,p in enumerate(y,1):curr.append(min(curr[-1]+1,prev[j]+1,prev[j-1]+(n!=p)))
-        prev=curr
-    pitch=round(100*(1-prev[-1]/max(len(x),len(y))),1)
+    aligned=_align_excerpt(ref,played)
+    if aligned is None:return None
+    rs,re,ps,pe,pairs,edits,ambiguous=aligned
+    x=ref[rs:re]; y=played[ps:pe]; matches=len(pairs)
+    pitch=round(max(0,100*(1-edits/max(len(x),len(y)))),1)
     metrics={'notation_accuracy':pitch}
     intervals=[]
     se=s.get('events') or []; ae=a.get('events') or []
@@ -468,13 +506,12 @@ def estimate_partial(score, audio, bpm=None):
                 if isinstance(v,bool) or not isinstance(v,(int,float)) or not math.isfinite(v) or v<0 or (k==duration and v==0):return False
         return all(events[i][start]<=events[i+1][start] for i in range(len(notes)-1))
     # Timing only on consecutive exact anchors, with sufficiently confident audio.
-    if s.get('confidence')=='high' and valid_events(se,ref,'onset_beats','duration_beats') and valid_events(ae,played,'start','duration'):
-        for b in chosen:
-            for k in range(b.size-1):
-                i,j=b.a+k,b.b+k
-                if any(isinstance(e.get('confidence'),bool) or not isinstance(e.get('confidence'),(int,float)) or not math.isfinite(e['confidence']) or not .65<=e['confidence']<=1 for e in ae[j:j+2]):continue
-                rb=se[i+1]['onset_beats']-se[i]['onset_beats']; ps=ae[j+1]['start']-ae[j]['start']
-                if rb>0 and ps>.02:intervals.append((rb,ps))
+    if not ambiguous and s.get('confidence')=='high' and valid_events(se,ref,'onset_beats','duration_beats') and valid_events(ae,played,'start','duration'):
+        for (i,j),(i2,j2) in zip(pairs,pairs[1:]):
+            if i2!=i+1 or j2!=j+1:continue
+            if any(isinstance(e.get('confidence'),bool) or not isinstance(e.get('confidence'),(int,float)) or not math.isfinite(e['confidence']) or not .65<=e['confidence']<=1 for e in ae[j:j+2]):continue
+            rb=se[i2]['onset_beats']-se[i]['onset_beats']; ps_delta=ae[j2]['start']-ae[j]['start']
+            if rb>0 and ps_delta>.02:intervals.append((rb,ps_delta))
         if len(intervals)>=4:
             scale=median(p/r for r,p in intervals)
             metrics['rhythm']=round(100*(1-mean(min(1,abs(p/(r*scale)-1)) for r,p in intervals)),1)
@@ -484,9 +521,9 @@ def estimate_partial(score, audio, bpm=None):
     grade=round(sum(_PARTIAL_WEIGHTS[k]*v for k,v in metrics.items())/weight,1)
     return {'status':'estimated','scope':'observed_excerpt_only','partial_score_100':grade,'measured_weight_percent':weight,
             'criteria':{k:{'score_percent':metrics.get(k),'weight':w,'status':'estimated' if k in metrics else 'not_measured'} for k,w in _PARTIAL_WEIGHTS.items()},
-            'reference_start':first.a+1,'performed_start':first.b+1,'reference_count':len(x),'performed_count':len(y),
+            'reference_start':rs+1,'performed_start':ps+1,'reference_count':len(x),'performed_count':len(y),
             'compared_note_count':min(len(x),len(y)),'matched_anchor_notes':matches,'compared_intervals':len(intervals),
-            'professional_score_100':None,'technical_score_100':None,'warning':'Taxminiy parcha bahosi, yakuniy professional baho emas.'}
+            'professional_score_100':None,'technical_score_100':None,'alignment_ambiguous':ambiguous,'warning':'Taxminiy parcha bahosi, yakuniy professional baho emas.'+(' Bir nechta mos parcha bor; joylashuv noaniq.' if ambiguous else '')}
 
 
 def _partial_report(score_data, audio_data, comparison, report, profile, score_type, stage, reason, bpm=None, observed=None):
@@ -522,7 +559,7 @@ def _partial_report(score_data, audio_data, comparison, report, profile, score_t
             metrics[metrics_map[k]]={"value_percent":item["score_percent"],"status":item["status"],"scope":"observed_excerpt_only"}
         summary=f"Qisman tahlil. {' '.join(covered)} Moslashtirilgan parchada taxminiy baho {observed['partial_score_100']}/100. Mezonlar vaznining {observed['measured_weight_percent']} foizi o‘lchandi; bu asar qamrovi yoki yakuniy baho emas."
         issues=[]
-        teacher="Faqat moslashtirilgan parcha bo‘yicha taxminiy baho. O‘qilmagan qismga va o‘lchanmagan mezonlarga baho berilmadi."
+        teacher="Faqat moslashtirilgan parcha bo‘yicha taxminiy baho. O‘qilmagan qismga va o‘lchanmagan mezonlarga baho berilmadi."+ (" Bir nechta bir xil mos parcha mavjud; joylashuv noaniq." if observed.get("alignment_ambiguous") else "")
         plans=[{"minutes":5,"task":"Moslashtirilgan parchani asl nota bilan tekshirish"},{"minutes":5,"task":"Parchani sekin tempda takrorlash"},{"minutes":5,"task":"Qolgan qismni alohida tekshirish"}]
         if observed is not None:
             comparison={"reference_count":observed["reference_count"],"performed_count":observed["performed_count"],"compared_note_count":observed["compared_note_count"],"note_similarity_percent":observed["criteria"]["notation_accuracy"]["score_percent"],"comparison_status":"tentative","assessment_scope":"observed_excerpt_only","reference_start":observed["reference_start"],"performed_start":observed["performed_start"],"rhythm_scored":observed["criteria"]["rhythm"]["score_percent"] is not None,"detailed_feedback":{"correct_notes":observed["matched_anchor_notes"],"errors":[],"error_counts":{}}}
@@ -554,7 +591,7 @@ async def _run_files(pdf_bytes,audio_bytes,score_name,audio_name,exercise,bpm,be
         return cached_grade
     def progress(stage,reason="in_progress"):
         if emit:
-            partial=_partial_report(score_data,audio_data,comparison,report,profile,score_type,stage,reason,bpm=bpm,observed=checkpoint_grade())
+            partial=_partial_report(score_data,audio_data,None,None,profile,score_type,stage,reason,bpm=bpm,observed=checkpoint_grade())
             if partial:emit(partial)
     def audio_checkpoint(data):
         nonlocal audio_data
@@ -587,6 +624,15 @@ async def _run_files(pdf_bytes,audio_bytes,score_name,audio_name,exercise,bpm,be
     except Exception as exc:
         failures.append(("score",_safe_reason(exc)));_LOG.warning("NOTA_PARTIAL score %s",failures[-1][1])
     # Incomplete transcriptions must never be compared as though they are full pieces.
+    if score_data and audio_data:
+        rn=len(score_data.get("notes") or []); pn=len(audio_data.get("notes") or [])
+        if min(rn,pn)>0 and min(rn,pn)/max(rn,pn)<.8:
+            observed=checkpoint_grade()
+            _LOG.info("NOTA_EXCERPT_ALIGNMENT ref=%d audio=%d compared=%d estimated=%s",rn,pn,observed["compared_note_count"] if observed else 0,bool(observed))
+            partial=_partial_report(score_data,audio_data,None,None,profile,score_type,"comparison","unequal_observed_coverage",bpm=bpm,observed=observed)
+            if partial:
+                partial["stage_failures"]=[{"stage":k,"reason":v} for k,v in failures]
+                return partial
     if not failures and score_data and audio_data:
         try:
             if loop.time()>=deadline-5:raise TimeoutError()
@@ -610,19 +656,7 @@ async def _run_files(pdf_bytes,audio_bytes,score_name,audio_name,exercise,bpm,be
             if final_grade is None:final_grade=grade.get("technical_score_100")
             if not isinstance(final_grade,(int,float)) or isinstance(final_grade,bool) or not math.isfinite(final_grade):
                 observed=checkpoint_grade()
-                if observed is None:
-                    # Both transcriptions completed and the full sequence comparison exists.
-                    # Use its measured similarity only, not fabricated timing or technique.
-                    similarity=comparison.get("note_similarity_percent")
-                    ref_count=len(score_data.get("notes") or [])
-                    perf_count=len(audio_data.get("notes") or [])
-                    if min(ref_count,perf_count)>0 and isinstance(similarity,(int,float)) and not isinstance(similarity,bool) and math.isfinite(similarity) and 0<=similarity<=100:
-                        observed={"status":"estimated","scope":"observed_excerpt_only","partial_score_100":round(similarity,1),"measured_weight_percent":25,
-                            "criteria":{k:{"score_percent":similarity if k=="notation_accuracy" else None,"weight":w,"status":"estimated" if k=="notation_accuracy" else "not_measured"} for k,w in _PARTIAL_WEIGHTS.items()},
-                            "reference_start":1,"performed_start":1,"reference_count":ref_count,"performed_count":perf_count,"compared_note_count":min(ref_count,perf_count),
-                            "matched_anchor_notes":comparison.get("detailed_feedback",{}).get("correct_notes",0),"compared_intervals":0,
-                            "professional_score_100":None,"technical_score_100":None,"warning":"O‘lchangan nota ketma-ketligi mosligi; yakuniy professional baho emas."}
-                partial=_partial_report(score_data,audio_data,comparison,report,profile,score_type,"grading","final_grade_not_validated",bpm=bpm,observed=observed)
+                partial=_partial_report(score_data,audio_data,None,None,profile,score_type,"grading","final_grade_not_validated",bpm=bpm,observed=observed)
                 if partial:
                     partial["stage_failures"]=[]
                     return partial
@@ -631,7 +665,7 @@ async def _run_files(pdf_bytes,audio_bytes,score_name,audio_name,exercise,bpm,be
             failures.append(("report" if comparison is not None else "comparison",_safe_reason(exc)))
     observed=checkpoint_grade()
     stage,reason=failures[-1] if failures else ("analysis","no_evidence")
-    partial=_partial_report(score_data,audio_data,comparison,report,profile,score_type,stage,reason,bpm=bpm,observed=observed)
+    partial=_partial_report(score_data,audio_data,None,None,profile,score_type,stage,reason,bpm=bpm,observed=observed)
     if partial:
         partial["stage_failures"]=[{"stage":k,"reason":v} for k,v in failures]
         return partial
