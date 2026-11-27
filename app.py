@@ -604,6 +604,28 @@ async def _run_files(pdf_bytes,audio_bytes,score_name,audio_name,exercise,bpm,be
                 report["sections"]["baholash_mezonlari"]["ritm"]=timed["rhythm"]
                 report["sections"]["baholash_mezonlari"]["temp"]=timed["tempo"]
                 report["timed_errors"]=timed["note_errors"]
+            # Transcription completion is not the same as a validated final grade.
+            # Keep the observed estimate separately; never put it in a final-grade field.
+            final_grade=grade.get("professional_score_100")
+            if final_grade is None:final_grade=grade.get("technical_score_100")
+            if not isinstance(final_grade,(int,float)) or isinstance(final_grade,bool) or not math.isfinite(final_grade):
+                observed=checkpoint_grade()
+                if observed is None:
+                    # Both transcriptions completed and the full sequence comparison exists.
+                    # Use its measured similarity only, not fabricated timing or technique.
+                    similarity=comparison.get("note_similarity_percent")
+                    ref_count=len(score_data.get("notes") or [])
+                    perf_count=len(audio_data.get("notes") or [])
+                    if min(ref_count,perf_count)>0 and isinstance(similarity,(int,float)) and not isinstance(similarity,bool) and math.isfinite(similarity) and 0<=similarity<=100:
+                        observed={"status":"estimated","scope":"observed_excerpt_only","partial_score_100":round(similarity,1),"measured_weight_percent":25,
+                            "criteria":{k:{"score_percent":similarity if k=="notation_accuracy" else None,"weight":w,"status":"estimated" if k=="notation_accuracy" else "not_measured"} for k,w in _PARTIAL_WEIGHTS.items()},
+                            "reference_start":1,"performed_start":1,"reference_count":ref_count,"performed_count":perf_count,"compared_note_count":min(ref_count,perf_count),
+                            "matched_anchor_notes":comparison.get("detailed_feedback",{}).get("correct_notes",0),"compared_intervals":0,
+                            "professional_score_100":None,"technical_score_100":None,"warning":"O‘lchangan nota ketma-ketligi mosligi; yakuniy professional baho emas."}
+                partial=_partial_report(score_data,audio_data,comparison,report,profile,score_type,"grading","final_grade_not_validated",bpm=bpm,observed=observed)
+                if partial:
+                    partial["stage_failures"]=[]
+                    return partial
             return {"analysis_status":"complete","score":score_data,"score_input_type":score_type,"audio":audio_data,"comparison":comparison,"professional_report":report,"selected_instrument":profile["id"] if profile else None,"instrument_guidance":guidance,"timed_analysis":timed,"technical_grading":grade,"professional_grading":professional_grade({}),"limitations":["Monophonic melody only","No verified rhythm assessment","AI sheet-music extraction may be inaccurate","Instrument harmonics may affect pitch detection","Video is assessed from its extracted audio only","File accepted does not guarantee accurate transcription"]}
         except Exception as exc:
             failures.append(("report" if comparison is not None else "comparison",_safe_reason(exc)))
