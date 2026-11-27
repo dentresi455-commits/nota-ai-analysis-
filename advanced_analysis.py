@@ -4,6 +4,17 @@ import numpy as np
 from scipy.signal import find_peaks
 
 
+def _strong_attacks(samples, rate):
+    # Detect independent pluck/envelope resets, including repeated pitches.
+    # A conservative 2.2x rise over a preceding quiet window prevents ordinary vibrato splits.
+    step=max(1,round(rate*.005)); x=np.asarray(samples,dtype=float)
+    if len(x)<step*20:return []
+    rms=np.sqrt(np.mean(x[:len(x)//step*step].reshape(-1,step)**2,axis=1))
+    rise=np.diff(np.log(rms+.001))
+    peaks,_=find_peaks(rise,height=math.log(2.2),distance=max(1,round(.085*rate/step)))
+    return [float((i+1)*step/rate) for i in peaks if rms[i+1]>.025 and rms[i+1]-rms[i]>.018]
+
+
 def extract_events(samples, rate, hop_seconds=.025):
     """Extract stable pitch and retain high-confidence fractional MIDI measurements."""
     hop=max(1,round(rate*hop_seconds));win=max(2048,round(rate*.08));frames=[]
@@ -25,6 +36,9 @@ def extract_events(samples, rate, hop_seconds=.025):
         local=[v for v in notes[max(0,i-1):min(len(notes),i+2)] if v is not None]
         smooth.append(int(np.median(local)) if x is not None and len(local)>=2 else x)
     events=[];start_idx=None;last=None
+    attacks=_strong_attacks(samples,rate)
+    # The pitch frame is forward-looking. Map the envelope attack to the frame center.
+    attack_frames={max(1,round((t-win/(2*rate))/(hop/rate))) for t in attacks}
     def emit(end_idx):
         if start_idx is None or last is None:return
         duration=(end_idx-start_idx)*hop/rate
@@ -39,7 +53,12 @@ def extract_events(samples, rate, hop_seconds=.025):
                 e['pitch_measurement_frames']=len(values)
             events.append(e)
     for i,n in enumerate(smooth):
-        if n!=last:emit(i);start_idx=i if n is not None else None;last=n
+        if n!=last:
+            emit(i);start_idx=i if n is not None else None;last=n
+        elif n is not None and i in attack_frames and start_idx is not None and (i-start_idx)*hop/rate>=.085:
+            # Only split an existing stable pitch, not an already detected pitch transition.
+            if i+4<=len(smooth) and all(v==n for v in smooth[i:i+4]):
+                emit(i);start_idx=i
     emit(len(smooth));return events
 
 

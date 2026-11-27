@@ -4,7 +4,7 @@ import math, os, subprocess, tempfile, wave, time
 from pathlib import Path
 import numpy as np
 from fastapi import HTTPException
-from advanced_analysis import extract_events
+from advanced_analysis import extract_events, _strong_attacks
 _SUPPORTED={'.wav','.mp3','.m4a','.ogg','.flac','.webm','.aac','.mp4','.mov','.mkv','.avi','.m4v'}
 _MAX_SECONDS=900
 _MAX_INPUT_BYTES=96*1024*1024
@@ -44,9 +44,9 @@ def audio_to_notes(raw,filename,*,on_progress=None,deadline=None):
     ext=Path(filename or '').suffix.lower()
     if ext not in _SUPPORTED:raise HTTPException(415,'Unsupported audio/video format')
     if not raw or len(raw)>_MAX_INPUT_BYTES:raise HTTPException(413,'Audio file is empty or exceeds 96 MB')
-    limit=_allowed_seconds();events=[];analyzed_chunks=0;analyzed_seconds=0.;duration=0.
+    limit=_allowed_seconds();events=[];attacks=[];analyzed_chunks=0;analyzed_seconds=0.;duration=0.
     def snapshot(incomplete,reason=None):
-        return {'notes':[e['midi'] for e in events],'events':[dict(e) for e in events],'timing_status':'estimated_from_monophonic_audio','duration_seconds':duration,'analyzed_seconds':round(analyzed_seconds,3),'incomplete':incomplete,'method':'overlapping 30-second autocorrelation chunks (monophonic estimate)','chunks_analyzed':analyzed_chunks,'max_audio_seconds':limit,'total_detected_events':len(events),'note_sequence_capped':False,'warnings':[reason] if reason else [],'stop_reason':reason}
+        return {'notes':[e['midi'] for e in events],'events':[dict(e) for e in events],'attack_times_seconds':list(attacks),'timing_status':'estimated_from_monophonic_audio','duration_seconds':duration,'analyzed_seconds':round(analyzed_seconds,3),'incomplete':incomplete,'method':'overlapping 30-second autocorrelation chunks (monophonic estimate)','chunks_analyzed':analyzed_chunks,'max_audio_seconds':limit,'total_detected_events':len(events),'note_sequence_capped':False,'warnings':[reason] if reason else [],'stop_reason':reason}
     with tempfile.TemporaryDirectory(prefix='nota_long_audio_') as tmp:
         source=Path(tmp)/('input'+ext);target=Path(tmp)/'normalized.wav';source.write_bytes(raw)
         command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-i',str(source),'-map','0:a:0','-vn','-sn','-dn','-t',str(limit+1),'-ac','1','-ar',str(_RATE),'-c:a','pcm_s16le',str(target)]
@@ -72,6 +72,9 @@ def audio_to_notes(raw,filename,*,on_progress=None,deadline=None):
                     next_events=events.copy()
                     if next_events:next_events[-1]=dict(next_events[-1])
                     for item in segment:_add_clipped_event(next_events,item,read_left/_RATE,core_left/_RATE,core_right/_RATE)
+                    new_attacks=[round(t+read_left/_RATE,4) for t in _strong_attacks(chunk,_RATE) if core_left/_RATE<=t+read_left/_RATE<core_right/_RATE]
+                    if core_left==0 and segment and segment[0]['start']<=.05:new_attacks.insert(0,0.)
+                    attacks.extend(t for t in new_attacks if not attacks or t-attacks[-1]>=.08)
                     events=next_events;analyzed_chunks+=1;analyzed_seconds=core_right/_RATE
                     if on_progress and events:on_progress(snapshot(True))
             except Exception as exc:
