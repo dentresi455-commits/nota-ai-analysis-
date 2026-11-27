@@ -12,7 +12,7 @@ import io
 from typing import Optional
 from starlette.concurrency import run_in_threadpool
 from timing_analysis import Event, analyze
-from advanced_analysis import extract_events, technical_score
+from advanced_analysis import extract_events, technical_score, _strong_attacks
 from professional_grading import grade as professional_grade
 from instrument_profiles import INSTRUMENTS, get_instrument, instrument_guidance
 
@@ -401,7 +401,7 @@ def audio_to_notes(raw, filename):
     events=extract_events(samples,rate)
     if events:
         collapsed=[e["midi"] for e in events]
-    return {"notes": collapsed[:300], "events":events,
+    return {"notes": collapsed[:300], "events":events, "attack_times_seconds": ([0.] if events and events[0]["start"]<=.05 else [])+_strong_attacks(samples,rate),
             "timing_status":"estimated_from_monophonic_audio" if events else "not_available",
             "duration_seconds": round(len(samples) / rate, 2),
             "method": "spectral dominant pitch (monophonic approximation)"}
@@ -482,8 +482,76 @@ def _align_excerpt(ref, played):
     return (begin,finish,0,n,[(j,i) for i,j in pairs],edits,ambiguous,[(k,j,i) for k,i,j in operations])
 
 
+def _configure_score_reader(module):
+    # Keep simultaneous printed noteheads as distinct pitches at the SAME onset.
+    # Existing OMR validator and page join preserve equal-onset events.
+    marker="NOTA_V099_CHORD_EVENTS"
+    if marker in module.PROMPT:return
+    old="Only transcribe the principal monophonic\nmelody; do not invent illegible notes."
+    new="Transcribe every readable printed pitched notehead, including simultaneous pitches; do not invent illegible notes."
+    old2='If two notes form a chord, do not silently invent a single melodic note;\nset needs_review true and warn "polyphony" or "chord_not_supported".'
+    new2='If notes share an attack, output one event per pitch with identical onset_beats, sorted lowest pitch first. Add warning "polyphony" and needs_review true. Do not serialize chords as sequential attacks.'
+    if old not in module.PROMPT or old2 not in module.PROMPT:raise RuntimeError("omr_prompt_version_mismatch")
+    module.PROMPT=module.PROMPT.replace(old,new).replace(old2,new2).replace("standard monophonic five-line staff","conventional five-line staff")+"\nNOTA_V099_CHORD_EVENTS: Distinguish number of noteheads from number of attacks. For repeated identical pitches, output each printed attack separately (except ties). Preserve accidentals, clefs and every chord pitch. If uncertain, flag it; do not guess."
+    original_join=module._join_pages
+    def join_with_warnings(pages):
+        result=original_join(pages)
+        result['score_warnings']=list(dict.fromkeys(str(w) for page in pages for w in page.get('warnings',[])))
+        return result
+    module._join_pages=join_with_warnings
+
+
+def _score_pitch_component(score):
+    # Chord noteheads are not a sequence of attacks. Compare only the upper
+    # printed pitch per attack when all pitches/timing are represented.
+    # No claim about the remaining voice or simultaneous chord accuracy.
+    ev=score.get('events') or []; notes=score.get('notes') or []
+    groups=[]
+    if len(ev)==len(notes) and ev:
+        for n,e in zip(notes,ev):
+            if not isinstance(e,dict) or e.get('midi')!=n or type(e.get('onset_beats')) not in (int,float) or not math.isfinite(e['onset_beats']):return None,None
+            t=e['onset_beats']
+            if groups and t<groups[-1][0]:return None,None
+            if groups and abs(t-groups[-1][0])<1e-6:groups[-1][1].append(e)
+            else:groups.append((t,[e]))
+    has_chords=any(len(g)>1 for _,g in groups)
+    warnings=[str(w) for w in [*score.get('warnings',[]),*score.get('score_warnings',[])]]
+    for page in score.get('pages',[]):
+        if isinstance(page,dict):warnings.extend(str(w) for w in page.get('warnings',[]))
+    if not has_chords:
+        if any('polyphony' in w or 'chord_not_supported' in w for w in warnings):return None,None
+        return score,None
+    selected=[max(g,key=lambda e:e['midi']) for _,g in groups]
+    return {**score,'notes':[e['midi'] for e in selected],'events':selected,'confidence':'low'},'upper_printed_pitch'
+
+
+def _audio_observations(audio):
+    events=audio.get('events') or []; valid=[]
+    for e in events:
+        if not isinstance(e,dict):continue
+        c=e.get('pitch_deviation_cents');f=e.get('pitch_measurement_frames');conf=e.get('confidence')
+        if type(c) in (int,float) and math.isfinite(c) and abs(c)<=50 and type(f) is int and f>=3 and type(conf) in (int,float) and .65<=conf<=1:valid.append(c)
+    starts=audio.get('attack_times_seconds') or []
+    starts=[t for t in starts if type(t) in (int,float) and math.isfinite(t) and t>=0]
+    intervals=[b-a for a,b in zip(starts,starts[1:]) if .08<=b-a<=5]
+    result={'attack_count':len(starts),'pitch_event_count':len(events)}
+    if len(intervals)>=4:
+        result['median_attack_interval_seconds']=round(median(intervals),3)
+        result['attack_intervals_count']=len(intervals)
+        result['minimum_attack_interval_seconds']=round(min(intervals),3)
+        result['maximum_attack_interval_seconds']=round(max(intervals),3)
+    if len(valid)>=5:
+        result['intonation_samples']=len(valid)
+        result['median_absolute_cents']=round(median(abs(c) for c in valid),2)
+        result['intonation_deviation_count']=sum(abs(c)>25 for c in valid)
+        result['intonation_reference']='A4=440 Hz; nearest equal-tempered pitch, not score agreement'
+    return result
+
+
 def estimate_partial(score, audio, bpm=None):
     s=score or {}; a=audio or {}
+    s,component=_score_pitch_component(s)
+    if s is None:return None
     # Search farther into the longer stream while limiting the scored shorter excerpt.
     ref=list(s.get('notes') or [])[:1024]; played=list(a.get('notes') or [])[:1024]
     if len(ref)<=len(played):ref=ref[:256]
@@ -569,7 +637,7 @@ def estimate_partial(score, audio, bpm=None):
             'criteria':{k:{'score_percent':metrics.get(k),'weight':w,'status':'estimated' if k in metrics else 'not_measured'} for k,w in _PARTIAL_WEIGHTS.items()},
             'reference_start':rs+1,'performed_start':ps+1,'reference_count':len(x),'performed_count':len(y),
             'compared_note_count':min(len(x),len(y)),'matched_anchor_notes':matches,'compared_intervals':len(intervals),
-            'edit_count':edits,'error_counts':counts,'errors':errors,'intonation_note_count':len(intonation) if 'intonation' in metrics else 0,'observed_tempo_bpm':round(60/scale,1) if 'rhythm' in metrics else None,
+            'comparison_component':component or 'monophonic_pitch','edit_count':edits,'error_counts':counts,'errors':errors,'intonation_note_count':len(intonation) if 'intonation' in metrics else 0,'observed_tempo_bpm':round(60/scale,1) if 'rhythm' in metrics else None,
             'professional_score_100':None,'technical_score_100':None,'alignment_ambiguous':ambiguous,'warning':'Taxminiy parcha bahosi, yakuniy professional baho emas.'+(' Bir nechta mos parcha bor; joylashuv noaniq.' if ambiguous else '')}
 
 
@@ -611,8 +679,21 @@ def _partial_report(score_data, audio_data, comparison, report, profile, score_t
         plans.append({'minutes':5,'task':'Moslashtirilgan parchani sekin tempda qayta ijro etish'})
         plans.append({'minutes':3,'task':'Shu parchani qayta yozib natijalarni solishtirish'})
         comparison={"reference_count":observed["reference_count"],"performed_count":observed["performed_count"],"compared_note_count":observed["compared_note_count"],"note_similarity_percent":observed["criteria"]["notation_accuracy"]["score_percent"],"comparison_status":"tentative","assessment_scope":"observed_excerpt_only","reference_start":observed["reference_start"],"performed_start":observed["performed_start"],"rhythm_scored":observed["criteria"]["rhythm"]["score_percent"] is not None,"detailed_feedback":{"correct_notes":exact,"errors":issues,"error_counts":counts}}
+    audio_obs=_audio_observations(a)
+    if observed is None and an:
+        teacher="Ijro yozuvida ajratilgan tovushlar asosida quyidagi o‘lchovlar olindi. Nota bilan mos parcha tasdiqlanmagani uchun nota xatolari va umumiy ball belgilanmadi. "
+        if audio_obs.get('attack_intervals_count'):
+            teacher+=f"{audio_obs['attack_intervals_count']} ta zarb oralig‘i o‘lchandi; median {audio_obs['median_attack_interval_seconds']} soniya. "
+            metrics['ijro_zarb_oraligi']={'value_seconds':audio_obs['median_attack_interval_seconds'],'scope':'audio_only'}
+        if audio_obs.get('intonation_samples'):
+            teacher+=f"{audio_obs['intonation_samples']} ta barqaror tovushning A4=440 Hz etaloniga nisbatan median mutlaq og‘ishi {audio_obs['median_absolute_cents']} sent. "
+            metrics['tovush_sozlanishi']={'median_absolute_cents':audio_obs['median_absolute_cents'],'scope':'audio_only'}
+            if audio_obs['intonation_deviation_count']:plans.append({'minutes':5,'task':'Cholg‘u sozini tyuner bilan tekshirish'})
+    if observed is not None and observed.get('comparison_component')=='upper_printed_pitch':
+        teacher="Ikki tovushli yozuvning faqat yuqori nota chizig‘i audio tovushlariga solishtirildi. Nota raqamlari zarb tartibini bildiradi. Pastki ovoz va birgalikdagi zarb bahoga kiritilmadi. "+teacher
+        summary="Yuqori nota chizig‘i bo‘yicha. "+summary
     guidance=instrument_guidance(profile)
-    return {"analysis_status":"partial","completed_stages":[k for k,v in (("score",sn),("audio",an),("comparison",comparison is not None)) if v],
+    return {"audio_observations":audio_obs,"analysis_status":"partial","completed_stages":[k for k,v in (("score",sn),("audio",an),("comparison",comparison is not None)) if v],
         "stopped_stage":stage,"stop_reason":reason,"score":s or None,"score_input_type":score_type,"audio":a or None,
         "comparison":comparison,"partial_grading":observed,"professional_report":{"title":"NOTA AI — ijroning pedagogik tahlili","status":"partial","overall_grade_100":None,"partial_grading":observed,
         "sections":{"umumiy_xulosa":summary,"baholash_mezonlari":metrics,"aniqlangan_xatolar":issues,"pedagog_xulosasi":teacher,"individual_mashgulot_rejasi":plans},
@@ -662,8 +743,9 @@ async def _run_files(pdf_bytes,audio_bytes,score_name,audio_name,exercise,bpm,be
         if loop.time()>=deadline-5:raise TimeoutError()
         normalized_score,score_type=await run_in_threadpool(normalize_score,pdf_bytes,score_name)
         if os.getenv("NOTA_OMR_V3_ENABLED","false").lower()=="true":
-            from score_omr_v3 import pdf_to_notes as pdf_to_notes_v3
-            score_data=await pdf_to_notes_v3(normalized_score,exercise,on_progress=score_checkpoint,deadline=deadline-5)
+            import score_omr_v3
+            _configure_score_reader(score_omr_v3)
+            score_data=await score_omr_v3.pdf_to_notes(normalized_score,exercise,on_progress=score_checkpoint,deadline=deadline-5)
         else:
             async with asyncio.timeout(max(.1,deadline-loop.time()-5)):
                 score_data=await pdf_to_notes(normalized_score,exercise)
@@ -681,6 +763,10 @@ async def _run_files(pdf_bytes,audio_bytes,score_name,audio_name,exercise,bpm,be
             if partial:
                 partial["stage_failures"]=[{"stage":k,"reason":v} for k,v in failures]
                 return partial
+    component_data,component=_score_pitch_component(score_data or {})
+    if score_data and audio_data and (component or component_data is None):
+        partial=_partial_report(score_data,audio_data,None,None,profile,score_type,"comparison","chord_component_only",bpm=bpm,observed=checkpoint_grade())
+        if partial:return partial
     if not failures and score_data and audio_data:
         try:
             if loop.time()>=deadline-5:raise TimeoutError()
