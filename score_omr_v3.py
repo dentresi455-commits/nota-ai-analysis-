@@ -437,13 +437,12 @@ def _join_pages(pages: list[dict]) -> dict:
             "transcription_status":"estimated_unverified"}
 
 
-async def pdf_to_notes(data: bytes, exercise: int | None = None) -> dict:
+async def pdf_to_notes(data: bytes, exercise: int | None = None, *, on_progress=None, deadline=None) -> dict:
     """Bounded, concurrent per-system OMR for synchronous staging requests.
 
     Per-page order is preserved, even when Gemini calls finish out of order.
-    Any failed system rejects the complete comparison (never fabricate notes
-    or award a score from an incomplete transcription). Long music scores
-    require a durable queue/worker, not a longer HTTP timeout.
+    Retain the contiguous, successfully read prefix, never invent missing notes.
+    Optional checkpoint callback receives actual completed systems only.
     """
     if not isinstance(data, bytes) or len(data) > MAX_PDF_BYTES:
         raise HTTPException(status_code=413, detail="PDF too large")
@@ -484,8 +483,25 @@ async def pdf_to_notes(data: bytes, exercise: int | None = None) -> dict:
                 p["needs_review"] = True
             return p
 
+        def snapshot(partial, reason=None):
+            combined = _join_pages(chunks)
+            combined["pages"] = list(summaries)
+            combined["staff_system_count"] = len(chunks)
+            combined["omr_engine"] = "photo-aware-system-v3"
+            combined["omr_version"] = "3.3"
+            combined["needs_review"] = True
+            combined["transcription_status"] = "estimated_unverified"
+            combined["incomplete"] = partial
+            combined["total_pages"] = len(doc)
+            if reason:
+                combined["stop_reason"] = reason
+            return combined
+
         try:
-            async with asyncio.timeout(OMR_TOTAL_TIMEOUT_SECONDS):
+            seconds = OMR_TOTAL_TIMEOUT_SECONDS
+            if deadline is not None:
+                seconds = min(seconds, max(0, deadline - asyncio.get_running_loop().time()))
+            async with asyncio.timeout(seconds):
                 async with httpx.AsyncClient(timeout=request_timeout, limits=max_conn) as client:
                     for page_idx in range(len(doc)):
                         prepared = prepare_pdf_page(doc[page_idx])
@@ -500,45 +516,20 @@ async def pdf_to_notes(data: bytes, exercise: int | None = None) -> dict:
                         if len(original_crops) > MAX_SYSTEMS_PER_PAGE:
                             raise HTTPException(status_code=413, detail="Too many staff systems on a page")
                         page_warnings = list(prepared.warnings)
-                        jobs = [
-                            read_one(
+                        # Process one system at a time and commit its result immediately.
+                        # No completed system is discarded when a subsequent one fails.
+                        for idx, img in enumerate(original_crops):
+                            part = await read_one(
                                 original_crop=img, cleaned_crop=cleaned_crops[idx],
                                 page_idx=page_idx, system_idx=idx + 1,
                                 page_warnings=page_warnings, total_systems=len(original_crops),
                                 client=client,
                             )
-                            for idx, img in enumerate(original_crops)
-                        ]
-                        # Stop remaining provider requests on the first failed staff.
-                        # This avoids exhausting a free Gemini quota after a 429.
-                        tasks = [asyncio.create_task(job) for job in jobs]
-                        try:
-                            pending = set(tasks)
-                            while pending:
-                                done, pending = await asyncio.wait(
-                                    pending, return_when=asyncio.FIRST_COMPLETED,
-                                )
-                                for task in done:
-                                    error = task.exception()
-                                    if error is not None:
-                                        idx = tasks.index(task)
-                                        if isinstance(error, HTTPException):
-                                            code, status = str(error.detail), error.status_code
-                                        else:
-                                            code, status = "omr_system_failed", 502
-                                        raise HTTPException(
-                                            status_code=status,
-                                            detail={"code": code, "page": page_idx + 1,
-                                                    "system": idx + 1,
-                                                    "retryable": status in (502, 503, 504)},
-                                        ) from error
-                            # Await all tasks in *input* order, never in completion order.
-                            chunks.extend([task.result() for task in tasks])
-                        finally:
-                            for task in tasks:
-                                if not task.done():
-                                    task.cancel()
-                            await asyncio.gather(*tasks, return_exceptions=True)
+                            if sum(len(c["notes"]) for c in chunks) + len(part["notes"]) > MAX_NOTES:
+                                raise HTTPException(413, "Too many notes; use smaller batches")
+                            chunks.append(part)
+                            if on_progress is not None:
+                                on_progress(snapshot(True))
                         summaries.append({
                             "page": page_idx + 1,
                             "systems": len(original_crops),
@@ -548,21 +539,21 @@ async def pdf_to_notes(data: bytes, exercise: int | None = None) -> dict:
                             "annotation_fraction": round(prepared.masks.get("annotation_fraction", 0), 6),
                         })
                         # Release page and crop images before decoding the next page.
-                        del jobs, tasks, original_crops, cleaned_crops, prepared
+                        del original_crops, cleaned_crops, prepared, img
                         fitz.TOOLS.store_shrink(100)
         except TimeoutError:
-            raise HTTPException(status_code=504, detail={
-                "code": "omr_time_budget_exceeded", "retryable": True,
-                "message": "Try a shorter section; long scores require queued analysis",
-            }) from None
-
-        combined = _join_pages(chunks)
-        combined["pages"] = summaries
-        combined["staff_system_count"] = len(chunks)
-        combined["omr_engine"] = "photo-aware-system-v3-staging"
-        combined["omr_version"] = "3.2"
-        combined["needs_review"] = True
-        combined["transcription_status"] = "estimated_unverified"
-        return combined
+            if chunks:
+                return snapshot(True, "omr_time_budget_exceeded")
+            raise HTTPException(504, detail="omr_time_budget_exceeded") from None
+        except HTTPException as exc:
+            if chunks:
+                reason = exc.detail.get("code", "omr_stopped") if isinstance(exc.detail, dict) else str(exc.detail)
+                return snapshot(True, reason[:160])
+            raise
+        except Exception as exc:
+            if chunks:
+                return snapshot(True, "omr_system_failed_" + type(exc).__name__)
+            raise
+        return snapshot(False)
     finally:
         doc.close()

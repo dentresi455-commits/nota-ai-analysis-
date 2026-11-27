@@ -1,5 +1,8 @@
 import base64
 import asyncio
+import time
+import logging
+from fastapi.responses import StreamingResponse
 import json
 import math
 import os
@@ -27,7 +30,7 @@ try:
 except ImportError:
     pass
 
-app = FastAPI(title="NOTA AI Analysis", version="0.9.2")
+app = FastAPI(title="NOTA AI Analysis", version="0.9.3")
 # Reject concurrent heavy jobs rather than accumulating uploads in RAM.
 _ANALYSIS_LOCK = asyncio.Lock()
 MAX_PDF = (32 if os.getenv("NOTA_OMR_V3_ENABLED", "false").lower() == "true" else 8) * 1024 * 1024
@@ -204,7 +207,7 @@ if os.getenv("NOTA_FULL_ALIGNMENT_ENABLED", "false").lower() == "true":
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "0.9.1",
+    return {"status": "ok", "version": "0.9.3",
             "pdf_ai_configured": bool(os.getenv("GEMINI_API_KEY")),
             "omr_v3_enabled": os.getenv("NOTA_OMR_V3_ENABLED", "false").lower() == "true",
             "long_audio_enabled": os.getenv("NOTA_LONG_AUDIO_ENABLED", "false").lower() == "true",
@@ -413,68 +416,167 @@ def list_instruments():
     return {"count": len(INSTRUMENTS), "instruments": list(INSTRUMENTS.values())}
 
 
-@app.post("/v1/analyze-files")
-async def analyze_files(score: UploadFile = File(...), audio: UploadFile = File(...),
-                        authorization: Optional[str] = Header(None),
-                        exercise: Optional[int] = Form(None),
-                        bpm: Optional[float] = Form(None),
-                        beats_per_measure: Optional[int] = Form(None),
-                        instrument: Optional[str] = Form(None)):
-    authorize(authorization)
-    if _ANALYSIS_LOCK.locked():
-        raise HTTPException(503, "analysis_busy_retry_later", headers={"Retry-After": "10"})
-    async with _ANALYSIS_LOCK:
-        profile = get_instrument(instrument)
-        if instrument is not None and profile is None:
-            raise HTTPException(422, "Unknown instrument. See GET /v1/instruments")
-        if exercise is not None and not 1 <= exercise <= 99:
-            raise HTTPException(422, "Exercise must be between 1 and 99")
-        if bpm is not None and not 20 <= bpm <= 300:
-            raise HTTPException(422,"BPM must be 20..300")
-        if beats_per_measure is not None and not 1 <= beats_per_measure <= 12:
-            raise HTTPException(422,"beats_per_measure must be 1..12")
-        pdf_bytes = await read_limited(score, MAX_PDF)
-        audio_bytes = await read_limited(audio, MAX_AUDIO)
-        normalized_score, score_type = await run_in_threadpool(normalize_score, pdf_bytes, score.filename)
-        if os.getenv("NOTA_OMR_V3_ENABLED", "false").lower() == "true":
-            from score_omr_v3 import pdf_to_notes as pdf_to_notes_v3
-            score_data = await pdf_to_notes_v3(normalized_score, exercise)
+# NOTA v0.9.3: independent measured stages, bounded soft deadline, streaming checkpoints.
+# Full JSON compatibility is retained for existing clients. An explicit progress header
+# opts into NDJSON so a caller can recover the last measured result on disconnect.
+_ANALYSIS_SECONDS = 225
+_LOG = logging.getLogger("uvicorn.error")
+
+def _safe_reason(exc):
+    if isinstance(exc, HTTPException):
+        detail=exc.detail
+        return str(detail.get("code", "stage_failed") if isinstance(detail, dict) else detail)[:160]
+    return "time_budget_exceeded" if isinstance(exc, TimeoutError) else type(exc).__name__
+
+def _partial_report(score_data, audio_data, comparison, report, profile, score_type, stage, reason):
+    s=score_data or {}; a=audio_data or {}; sn=len(s.get("notes",[])); an=len(a.get("notes",[]))
+    if not (sn or an):return None
+    covered=[]
+    if sn:covered.append(f"Nota faylidan {sn} ta tovush o‘qildi ({s.get('staff_system_count', 0)} ta nota satri).")
+    if an:
+        secs=a.get("analyzed_seconds",a.get("duration_seconds"))
+        covered.append(f"Ijrodan {an} ta taxminiy tovush aniqlandi"+(f"; {secs:.1f} soniya o‘lchandi." if isinstance(secs,(int,float)) else "."))
+    summary="Qisman tahlil. "+" ".join(covered)
+    metrics={k:None for k in ("nota_ketma_ketligi","ritm","temp","intonatsiya","artikulyatsiya","ifodalilik")}
+    issues=[]; plans=[]; teacher="Mavjud natijalar dastlabki. O‘qilmagan qism bo‘yicha ijro xatosi yoki yakuniy ball belgilanmaydi."
+    if comparison is not None:
+        try:
+            existing=report or professional_report(comparison,s,a)
+            sec=existing["sections"]
+            metrics=sec["baholash_mezonlari"]
+            issues=sec["aniqlangan_xatolar"]
+            plans=sec["individual_mashgulot_rejasi"]
+            summary+=" "+sec["umumiy_xulosa"]
+            teacher=sec["pedagog_xulosasi"]+" Yakunlanmagan mezonlar baholanmadi."
+        except Exception:
+            comparison=None
+    if comparison is None:
+        summary+=" Nota va ijroning to‘liq mosligi hisoblanmadi; mavjud tovushlar alohida ko‘rsatildi."
+        if sn:plans.append({"minutes":5,"task":"O‘qilgan nota qismini asl partitura bilan tekshirish"})
+        if an:plans.append({"minutes":5,"task":"O‘lchangan ijro qismini sekin tempda qayta tinglash va pedagog bilan tekshirish"})
+        plans.append({"minutes":5,"task":"Qolgan qismni alohida, tiniq yozuv bilan tekshirish"})
+    guidance=instrument_guidance(profile)
+    return {"analysis_status":"partial","completed_stages":[k for k,v in (("score",sn),("audio",an),("comparison",comparison is not None)) if v],
+        "stopped_stage":stage,"stop_reason":reason,"score":s or None,"score_input_type":score_type,"audio":a or None,
+        "comparison":comparison,"professional_report":{"title":"NOTA AI — ijroning pedagogik tahlili","status":"partial","overall_grade_100":None,
+        "sections":{"umumiy_xulosa":summary,"baholash_mezonlari":metrics,"aniqlangan_xatolar":issues,"pedagog_xulosasi":teacher,"individual_mashgulot_rejasi":plans},
+        "instrument_guidance":guidance,"measurement_limitations":["O‘qilmagan yoki solishtirilmagan qism bo‘yicha xulosa berilmadi."]},
+        "selected_instrument":profile["id"] if profile else None,"instrument_guidance":guidance,"timed_analysis":None,
+        "technical_grading":{"status":"insufficient_evidence","technical_score_100":None,"professional_score_100":None},
+        "professional_grading":professional_grade({}),"limitations":["Qisman natija; yakuniy baho emas.","O‘lchovlar taxminiy va pedagog tekshiruvini talab qiladi."]}
+
+async def _run_files(pdf_bytes,audio_bytes,score_name,audio_name,exercise,bpm,beats_per_measure,profile,emit):
+    loop=asyncio.get_running_loop(); deadline=loop.time()+_ANALYSIS_SECONDS
+    score_data=audio_data=comparison=report=score_type=None
+    failures=[]
+    def progress(stage,reason="in_progress"):
+        if emit:
+            partial=_partial_report(score_data,audio_data,comparison,report,profile,score_type,stage,reason)
+            if partial:emit(partial)
+    def audio_checkpoint(data):
+        nonlocal audio_data
+        audio_data=data;progress("audio")
+    def score_checkpoint(data):
+        nonlocal score_data
+        score_data=data;progress("score")
+    # Audio is measured independently even if Gemini cannot read the first staff.
+    try:
+        if os.getenv("NOTA_LONG_AUDIO_ENABLED","false").lower()=="true":
+            from functools import partial
+            audio_data=await run_in_threadpool(partial(audio_to_notes,audio_bytes,audio_name,on_progress=lambda d:loop.call_soon_threadsafe(audio_checkpoint,d),deadline=min(deadline-10,loop.time()+105)))
         else:
-            score_data = await pdf_to_notes(normalized_score, exercise)
-        audio_data = await run_in_threadpool(audio_to_notes, audio_bytes, audio.filename)
-        result = await run_in_threadpool(compare_notes, score_data["notes"], audio_data["notes"])
-        report = professional_report(result, score_data, audio_data)
-        guidance = instrument_guidance(profile)
-        report["instrument_guidance"] = guidance
-        timed=None
-        grade={"status":"insufficient_evidence","technical_score_100":None,"professional_score_100":None}
-        if bpm and score_data.get("events") and audio_data.get("events"):
-            try:
-                reference=[Event(midi=e["midi"],start=e["onset_beats"]*60/bpm,
-                                 duration=e["duration_beats"]*60/bpm) for e in score_data["events"]]
-                performed=[Event(midi=e["midi"],start=e["start"],duration=e["duration"])
-                           for e in audio_data["events"]]
+            audio_data=await run_in_threadpool(audio_to_notes,audio_bytes,audio_name)
+        if audio_data.get("incomplete"):failures.append(("audio",audio_data.get("stop_reason") or "audio_incomplete"))
+        progress("score")
+    except Exception as exc:
+        failures.append(("audio",_safe_reason(exc)));_LOG.warning("NOTA_PARTIAL audio %s",failures[-1][1])
+    try:
+        if loop.time()>=deadline-5:raise TimeoutError()
+        normalized_score,score_type=await run_in_threadpool(normalize_score,pdf_bytes,score_name)
+        if os.getenv("NOTA_OMR_V3_ENABLED","false").lower()=="true":
+            from score_omr_v3 import pdf_to_notes as pdf_to_notes_v3
+            score_data=await pdf_to_notes_v3(normalized_score,exercise,on_progress=score_checkpoint,deadline=deadline-5)
+        else:
+            async with asyncio.timeout(max(.1,deadline-loop.time()-5)):
+                score_data=await pdf_to_notes(normalized_score,exercise)
+        if score_data.get("incomplete"):failures.append(("score",score_data.get("stop_reason") or "score_incomplete"))
+        progress("comparison")
+    except Exception as exc:
+        failures.append(("score",_safe_reason(exc)));_LOG.warning("NOTA_PARTIAL score %s",failures[-1][1])
+    # Incomplete transcriptions must never be compared as though they are full pieces.
+    if not failures and score_data and audio_data:
+        try:
+            if loop.time()>=deadline-5:raise TimeoutError()
+            comparison=await run_in_threadpool(compare_notes,score_data["notes"],audio_data["notes"])
+            progress("report")
+            report=professional_report(comparison,score_data,audio_data)
+            guidance=instrument_guidance(profile);report["instrument_guidance"]=guidance
+            timed=None;grade={"status":"insufficient_evidence","technical_score_100":None,"professional_score_100":None}
+            if bpm and score_data.get("events") and audio_data.get("events"):
+                if loop.time()>=deadline-3:raise TimeoutError()
+                reference=[Event(midi=e["midi"],start=e["onset_beats"]*60/bpm,duration=e["duration_beats"]*60/bpm) for e in score_data["events"]]
+                performed=[Event(midi=e["midi"],start=e["start"],duration=e["duration"]) for e in audio_data["events"]]
                 timed=await run_in_threadpool(analyze,reference,performed,60/bpm,beats_per_measure)
-                grade=technical_score(timed,score_confidence=score_data["confidence"],
-                                      audio_events=audio_data["events"])
-            except ValueError as error:
-                report["measurement_limitations"].append("Timed analysis unavailable: " + str(error))
-        if timed is not None:
-            report["sections"]["baholash_mezonlari"]["ritm"] = timed["rhythm"]
-            report["sections"]["baholash_mezonlari"]["temp"] = timed["tempo"]
-            report["timed_errors"] = timed["note_errors"]
-            report["sections"]["umumiy_xulosa"] += (
-                " Ritm va temp natijalari dastlabki hisoblangan baholar bo‘lib, "
-                "professional tekshiruvdan o‘tmagan."
-            )
-        return {"score": score_data, "score_input_type": score_type, "audio": audio_data,
-                "comparison": result, "professional_report": report,
-                "selected_instrument": profile["id"] if profile else None,
-                "instrument_guidance": guidance,
-                "timed_analysis":timed,"technical_grading":grade,
-                "professional_grading":professional_grade({}),
-                "limitations": ["Monophonic melody only", "No verified rhythm assessment",
-                                "AI sheet-music extraction may be inaccurate",
-                                "Instrument harmonics may affect pitch detection",
-                                "Video is assessed from its extracted audio only",
-                                "File accepted does not guarantee accurate transcription"]}
+                grade=technical_score(timed,score_confidence=score_data["confidence"],audio_events=audio_data["events"])
+                report["sections"]["baholash_mezonlari"]["ritm"]=timed["rhythm"]
+                report["sections"]["baholash_mezonlari"]["temp"]=timed["tempo"]
+                report["timed_errors"]=timed["note_errors"]
+            return {"analysis_status":"complete","score":score_data,"score_input_type":score_type,"audio":audio_data,"comparison":comparison,"professional_report":report,"selected_instrument":profile["id"] if profile else None,"instrument_guidance":guidance,"timed_analysis":timed,"technical_grading":grade,"professional_grading":professional_grade({}),"limitations":["Monophonic melody only","No verified rhythm assessment","AI sheet-music extraction may be inaccurate","Instrument harmonics may affect pitch detection","Video is assessed from its extracted audio only","File accepted does not guarantee accurate transcription"]}
+        except Exception as exc:
+            failures.append(("report" if comparison is not None else "comparison",_safe_reason(exc)))
+    stage,reason=failures[-1] if failures else ("analysis","no_evidence")
+    partial=_partial_report(score_data,audio_data,comparison,report,profile,score_type,stage,reason)
+    if partial:
+        partial["stage_failures"]=[{"stage":k,"reason":v} for k,v in failures]
+        return partial
+    raise HTTPException(502,detail={"code":"analysis_no_evidence","stage":stage,"reason":reason})
+
+@app.post("/v1/analyze-files")
+async def analyze_files(score: UploadFile=File(...),audio: UploadFile=File(...),
+                        authorization: Optional[str]=Header(None),exercise: Optional[int]=Form(None),
+                        bpm: Optional[float]=Form(None),beats_per_measure: Optional[int]=Form(None),
+                        instrument: Optional[str]=Form(None),x_nota_progress: Optional[str]=Header(None)):
+    authorize(authorization)
+    profile=get_instrument(instrument)
+    if instrument is not None and profile is None:raise HTTPException(422,"Unknown instrument")
+    if exercise is not None and not 1<=exercise<=99:raise HTTPException(422,"Exercise must be between 1 and 99")
+    if bpm is not None and not 20<=bpm<=300:raise HTTPException(422,"BPM must be 20..300")
+    if beats_per_measure is not None and not 1<=beats_per_measure<=12:raise HTTPException(422,"beats_per_measure must be 1..12")
+    if _ANALYSIS_LOCK.locked():raise HTTPException(503,"analysis_busy_retry_later",headers={"Retry-After":"10"})
+    # UploadFile lifetime is independent of the stream; copy bounded inputs before returning.
+    pdf_bytes=await read_limited(score,MAX_PDF);audio_bytes=await read_limited(audio,MAX_AUDIO)
+    args=(pdf_bytes,audio_bytes,score.filename,audio.filename,exercise,bpm,beats_per_measure,profile)
+    if x_nota_progress!="ndjson-v1":
+        if _ANALYSIS_LOCK.locked():raise HTTPException(503,"analysis_busy_retry_later")
+        async with _ANALYSIS_LOCK:return await _run_files(*args,emit=None)
+    async def stream():
+        queue=asyncio.Queue(maxsize=1);last=None;finished=False
+        def emit(data):
+            nonlocal last
+            if finished:return
+            last=data
+            if queue.full():queue.get_nowait()
+            queue.put_nowait({"type":"checkpoint","data":data})
+        async def produce():
+            nonlocal finished
+            try:
+                if _ANALYSIS_LOCK.locked():raise HTTPException(503,"analysis_busy_retry_later")
+                async with _ANALYSIS_LOCK:
+                    result=await _run_files(*args,emit=emit)
+                frame={"type":"final","data":result}
+            except Exception as exc:
+                frame={"type":"final","data":last} if last else {"type":"error","status":exc.status_code if isinstance(exc,HTTPException) else 502,"code":_safe_reason(exc)}
+            finished=True
+            if queue.full():queue.get_nowait()
+            queue.put_nowait(frame)
+        task=asyncio.create_task(produce())
+        try:
+            while True:
+                try:frame=await asyncio.wait_for(queue.get(),timeout=12)
+                except TimeoutError:frame={"type":"heartbeat"}
+                yield json.dumps(frame,ensure_ascii=False,separators=(",",":"))+"\n"
+                if frame["type"] in ("final","error"):break
+        finally:
+            if not task.done():task.cancel()
+            await asyncio.gather(task,return_exceptions=True)
+    return StreamingResponse(stream(),media_type="application/x-ndjson",headers={"Cache-Control":"no-store","X-Accel-Buffering":"no"})
